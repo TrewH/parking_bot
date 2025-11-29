@@ -201,7 +201,7 @@ class ParkingVisionNode(Node):
         (cx, cy), (bw, bh), angle_deg = rect
 
         # Convert to a consistent yaw (in radians)
-        # OpenCV angle: rotation of the rectangle; can be tricky, so we normalize.
+        # OpenCV angle: rotation of the rectangle, normalize
         if bw < bh:
             bw, bh = bh, bw
             angle_deg += 90.0
@@ -213,8 +213,8 @@ class ParkingVisionNode(Node):
         detection.yaw_rad = yaw_rad
 
         # If angle is between -45 and +45 deg, we say approach from "bottom"
-        # and map that to RIGHT or LEFT depending on your convention.
-        # For now, we pick RIGHT if angle is roughly horizontal.
+        # and map that to RIGHT or LEFT 
+        # pick RIGHT if angle is roughly horizontal
         norm_angle = (angle_deg + 180.0) % 180.0  # [0, 180)
         if 45.0 <= norm_angle <= 135.0:
             # Mostly vertical rectangle
