@@ -1,15 +1,16 @@
 # =============================================================================
 # File: visionNode.py
-# Description: Vision node for spot and object detection
+# Description: Vision node for spot and object detection with alignment
 #
-# Authors:   Trew Hoffman
+# Authors:   Trew Hoffman, Terri Tai
 # Created:     2025-11-26
+# Updated:     2025-11-29
 #
 # Notes:
 #   - This is a ROS2 node that integrates DepthAI (Oak-D), OpenCV, and AprilTag
 #     detection
 #   - Color thresholds and tag size placeholders must be tuned later with real hardware
-
+#   - Now includes alignment guidance for parallel parking
 # =============================================================================
 
 """
@@ -21,10 +22,13 @@ This node will:
 - Determine "long" and short sides of the spot
 - Perform basic occupancy detection (is there an obstacle)
 - Detect an AprilTag placed near the pre-parking pose
+- Provide alignment guidance for positioning alongside the spot
 
 Outputs: ROS Topics
 - /parking_bot/spot_info
 - /parking_bot/tag_pose
+- /parking_bot/spot_open
+- /parking_bot/alignment_command
 """
 
 from __future__ import annotations
@@ -35,8 +39,8 @@ import depthai as dai
 import numpy as np
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import Bool
-from geometry_msgs.msg import Pose2D
+from std_msgs.msg import Bool, String
+from geometry_msgs.msg import Pose2D, Twist
 
 
 class ApproachSide:
@@ -56,12 +60,30 @@ class ParkingSpotDetection:
         center_px: Tuple[int, int] = (0, 0),
         yaw_rad: float = 0.0,
         approach_side: int = ApproachSide.UNKNOWN,
+        width: float = 0.0,
+        height: float = 0.0,
     ) -> None:
         self.detected = detected
         self.is_open = is_open
         self.center_px = center_px
         self.yaw_rad = yaw_rad
         self.approach_side = approach_side
+        self.width = width
+        self.height = height
+
+
+class AlignmentCommand:
+    """
+    Alignment command types
+    """
+    ALIGNED = "ALIGNED"
+    MOVE_FORWARD = "MOVE_FORWARD"
+    MOVE_BACKWARD = "MOVE_BACKWARD"
+    TURN_LEFT = "TURN_LEFT"
+    TURN_RIGHT = "TURN_RIGHT"
+    ADJUST_CLOSER = "ADJUST_CLOSER"
+    ADJUST_FARTHER = "ADJUST_FARTHER"
+    LOST_SPOT = "LOST_SPOT"
 
 
 class ParkingVisionNode(Node):
@@ -80,6 +102,12 @@ class ParkingVisionNode(Node):
         )
         self.tag_pose_pub = self.create_publisher(
             Pose2D, "/parking_bot/tag_pose", 10
+        )
+        self.alignment_cmd_pub = self.create_publisher(
+            String, "/parking_bot/alignment_command", 10
+        )
+        self.alignment_error_pub = self.create_publisher(
+            Twist, "/parking_bot/alignment_error", 10
         )
 
         # DepthAI / OAK-D initialization
@@ -103,6 +131,12 @@ class ParkingVisionNode(Node):
             self.fy = 3009.0 # focal length / pixel size
             self.cx = 320.0 # Principal x-coordinate, x-pixels/2
             self.cy = 240.0 # Principal y coordinate, y-pixels/2
+
+        # Alignment thresholds (need to tune these with hardware!)
+        self.ALIGNMENT_TOLERANCE_PX = 50  # How close to center is "aligned"
+        self.ANGLE_TOLERANCE_RAD = 0.1    # ~5.7 degrees
+        self.TARGET_LATERAL_OFFSET_PX = 100  # Desired lateral distance from spot
+        self.LATERAL_TOLERANCE_PX = 30
 
         # Main loop timer (e.g. 20 Hz)
         self.timer = self.create_timer(0.05, self._process_frame)
@@ -144,10 +178,30 @@ class ParkingVisionNode(Node):
         # Detect parking spot
         spot = self._detect_parking_spot(frame)
 
-        # publish occupancy as a Bool
+        # Publish occupancy as a Bool
         open_msg = Bool()
         open_msg.data = bool(spot.detected and spot.is_open)
         self.spot_open_pub.publish(open_msg)
+
+        # Compute and publish alignment command
+        if spot.detected:
+            alignment_cmd, error = self._compute_alignment(spot, frame.shape)
+            
+            cmd_msg = String()
+            cmd_msg.data = alignment_cmd
+            self.alignment_cmd_pub.publish(cmd_msg)
+
+            # Publish alignment error as Twist (linear.x = forward/back, angular.z = rotation)
+            error_msg = Twist()
+            error_msg.linear.x = error[0]   # longitudinal error
+            error_msg.linear.y = error[1]   # lateral error
+            error_msg.angular.z = error[2]  # angular error
+            self.alignment_error_pub.publish(error_msg)
+        else:
+            # No spot detected
+            cmd_msg = String()
+            cmd_msg.data = AlignmentCommand.LOST_SPOT
+            self.alignment_cmd_pub.publish(cmd_msg)
 
 
     def _detect_parking_spot(self, frame_bgr: np.ndarray) -> ParkingSpotDetection:
@@ -175,7 +229,7 @@ class ParkingVisionNode(Node):
 
         mask = cv2.inRange(hsv, lower_tape, upper_tape)
 
-        # Morphological cleanup :devil-emoji: 
+        # Morphological cleanup
         kernel = np.ones((5, 5), np.uint8)
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
@@ -185,7 +239,7 @@ class ParkingVisionNode(Node):
         if not contours:
             return detection
 
-        # Pick  largest contour by area
+        # Pick largest contour by area
         contours = sorted(contours, key=cv2.contourArea, reverse=True)
         largest = contours[0]
 
@@ -211,6 +265,8 @@ class ParkingVisionNode(Node):
         detection.detected = True
         detection.center_px = (int(cx), int(cy))
         detection.yaw_rad = yaw_rad
+        detection.width = bw
+        detection.height = bh
 
         # If angle is between -45 and +45 deg, we say approach from "bottom"
         # and map that to RIGHT or LEFT 
@@ -250,6 +306,76 @@ class ParkingVisionNode(Node):
         detection.is_open = intensity_std < 20.0
 
         return detection
+
+    def _compute_alignment(
+        self, 
+        spot: ParkingSpotDetection, 
+        frame_shape: Tuple[int, int, int]
+    ) -> Tuple[str, Tuple[float, float, float]]:
+        """
+        Compute alignment command based on spot position relative to camera.
+        
+        For parallel parking, we want to:
+        1. Be alongside the spot (lateral alignment)
+        2. Be at the correct longitudinal position (front/back)
+        3. Be parallel to the spot (angular alignment)
+        
+        Returns:
+            (alignment_command, (longitudinal_error, lateral_error, angular_error))
+        """
+        h, w, _ = frame_shape
+        frame_center_x = w / 2
+        frame_center_y = h / 2
+        
+        spot_x, spot_y = spot.center_px
+        
+        # Compute errors
+        # Longitudinal: how far forward/back the spot is from frame center
+        longitudinal_error = spot_y - frame_center_y  # positive = spot is below center
+        
+        # Lateral: how far left/right the spot is from desired offset
+        # For parallel parking, we want the spot to be offset to one side
+        lateral_error = spot_x - (frame_center_x + self.TARGET_LATERAL_OFFSET_PX)
+        
+        # Angular: how parallel we are to the spot
+        angular_error = spot.yaw_rad  # 0 = parallel, non-zero = need rotation
+        
+        # Normalize angular error to [-pi, pi]
+        while angular_error > math.pi:
+            angular_error -= 2 * math.pi
+        while angular_error < -math.pi:
+            angular_error += 2 * math.pi
+        
+        # Decision logic
+        # Priority: 1) Angular alignment, 2) Lateral position, 3) Longitudinal position
+        
+        # Check if angular alignment is off
+        if abs(angular_error) > self.ANGLE_TOLERANCE_RAD:
+            if angular_error > 0:
+                return AlignmentCommand.TURN_RIGHT, (longitudinal_error, lateral_error, angular_error)
+            else:
+                return AlignmentCommand.TURN_LEFT, (longitudinal_error, lateral_error, angular_error)
+        
+        # Check lateral position (distance from spot)
+        if abs(lateral_error) > self.LATERAL_TOLERANCE_PX:
+            if lateral_error > 0:
+                # Spot is too far right, need to move closer (left)
+                return AlignmentCommand.ADJUST_CLOSER, (longitudinal_error, lateral_error, angular_error)
+            else:
+                # Spot is too far left, need to move farther (right)
+                return AlignmentCommand.ADJUST_FARTHER, (longitudinal_error, lateral_error, angular_error)
+        
+        # Check longitudinal position
+        if abs(longitudinal_error) > self.ALIGNMENT_TOLERANCE_PX:
+            if longitudinal_error > 0:
+                # Spot is below center, need to move forward
+                return AlignmentCommand.MOVE_FORWARD, (longitudinal_error, lateral_error, angular_error)
+            else:
+                # Spot is above center, need to move backward
+                return AlignmentCommand.MOVE_BACKWARD, (longitudinal_error, lateral_error, angular_error)
+        
+        # If we're here, we're aligned!
+        return AlignmentCommand.ALIGNED, (longitudinal_error, lateral_error, angular_error)
 
 
 # ROS2 entry point
