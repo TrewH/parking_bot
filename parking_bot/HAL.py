@@ -17,12 +17,10 @@ Hardware Abstraction Layer (HAL).
 This module is intended wrap VESC / steering control so the rest of the project can make calls based on distances and 
 steering commands rather than duty cycles and on-durations.
 
-We will measure how far the car moves under 0.05 duty cycle after 1 second of driving. This will give us a m/s velocity
-that we can use to drive a desired distance by scaling the time that we are sending the duty signal. 0.05 
-(or whatever otherduty cycle we deem a good speed) should be the only duty cycle used to reduce complexity. 
+We will use 0.05 duty cycle as the only speed in this project, and measure distance based on tachometry readings from the VESC to
+ensure accurate distance movements.  
 
-The rest of the robot's code should treat this HAL
-as the only interface to the physical car.
+The rest of the robot's code should treat this HAL as the only interface to the physical car.
 
 Typical use:
     hal = ParkingHAL()
@@ -37,7 +35,6 @@ Configuration:
 
 
 from __future__ import annotations
-
 import time
 from dataclasses import dataclass
 from typing import Optional
@@ -63,7 +60,6 @@ class HALConfig:
     """
     serial_port: str = "/dev/ttyACM0"
     base_duty_cycle: float = 0.05
-    base_speed_mps: float = 0.6   # Change after measuring
     steering: SteeringConfig = SteeringConfig()
     max_drive_duration_s: float = 5.0  # safety cap
 
@@ -74,6 +70,9 @@ class ParkingHAL:
     apply a fixed duty cycle. This class will produce callable methods we can use
     after determining what distances and angles we want to drive.
     """
+
+    # rotate wheel exactly one full turn by hand
+    COUNTS_PER_REV = 1 # placeholder
 
     def __init__(self, config: Optional[HALConfig] = None) -> None:
         self.config = config or HALConfig()
@@ -118,20 +117,8 @@ class ParkingHAL:
         self._set_duty_cycle(0.0)
 
     # ---------------------------------------------------------------------
-    # Distance-based movement
+    # Tachometry-based movement
     # ---------------------------------------------------------------------
-
-    def _distance_to_duration(self, distance_m: float) -> float:
-        """
-        Helper to convert desired distance to time based on measured mps
-        """
-        speed = self.config.base_speed_mps
-        if speed <= 0.0:
-            raise ValueError(
-                "mps must be > 0 "
-            )
-        duration = abs(distance_m) / speed
-        return min(duration, self.config.max_drive_duration_s)
 
     def drive_straight(self, distance_m: float, steering: float = 0.0) -> None:
         """
@@ -139,6 +126,8 @@ class ParkingHAL:
         Positive distance for forward
         Negative distance for backward
         """
+
+        # Zero protections
         if distance_m == 0.0:
             return
 
@@ -146,30 +135,22 @@ class ParkingHAL:
         if duty == 0.0:
             raise ValueError("base_duty_cycle cannot be 0")
 
-        # Choose duty sign based on desired direction
-        duty_signed = duty if distance_m > 0.0 else -duty
-        duration_s = self._distance_to_duration(distance_m)
+        # Get starting tachometer value
+        tach_start = self._vesc.get_values().tachometer
 
-        # Apply steering and go
+        # Set signed duty and steering
+        duty_signed = duty if distance_m > 0.0 else -duty
         self.set_steering(steering)
         self._set_duty_cycle(duty_signed)
 
-        time.sleep(duration_s)
-
+        # Continue moving until
+        target_counts = distance_m / WHEEL_CIRCUMFERENCE_M * COUNTS_PER_REV
+        while rclpy.ok():
+            values = self._vesc.get_values()
+            delta_counts = values.tachometer - tach_start
+            if abs(delta_counts) >= (target_counts):
+                break
+            
+            time.sleep(0.01) 
+        
         self.stop()
-
-    def drive_forward(self, distance_m: float, steering: float = 0.0) -> None:
-        """
-        Essentially an alias for drive_straight with more usable name
-        """
-        if distance_m < 0.0:
-            raise ValueError("distance_m must be >= 0 in drive_forward().")
-        self.drive_straight(distance_m=distance_m, steering=steering)
-
-    def drive_backward(self, distance_m: float, steering: float = 0.0) -> None:
-        """
-        Essentially an alias for drive_straight with more usable name
-        """
-        if distance_m < 0.0:
-            raise ValueError("distance_m must be >= 0 in drive_backward().")
-        self.drive_straight(distance_m=-distance_m, steering=steering)
