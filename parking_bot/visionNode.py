@@ -4,13 +4,14 @@
 #
 # Authors:   Trew Hoffman, Terri Tai
 # Created:     2025-11-26
-# Updated:     2025-11-29
+# Updated:     2025-1
 #
 # Notes:
 #   - This is a ROS2 node that integrates DepthAI (Oak-D), OpenCV, and AprilTag
 #     detection
 #   - Color thresholds and tag size placeholders must be tuned later with real hardware
 #   - Now includes alignment guidance for parallel parking
+#   - Added no parking sign detection using template matching
 # =============================================================================
 
 """
@@ -22,6 +23,7 @@ This node will:
 - Determine "long" and short sides of the spot
 - Perform basic occupancy detection (is there an obstacle)
 - Detect an AprilTag placed near the pre-parking pose
+- Detect no parking signs and mark spots as unavailable
 - Provide alignment guidance for positioning alongside the spot
 
 Outputs: ROS Topics
@@ -29,6 +31,7 @@ Outputs: ROS Topics
 - /parking_bot/tag_pose
 - /parking_bot/spot_open
 - /parking_bot/alignment_command
+- /parking_bot/no_parking_detected
 """
 
 from __future__ import annotations
@@ -62,6 +65,7 @@ class ParkingSpotDetection:
         approach_side: int = ApproachSide.UNKNOWN,
         width: float = 0.0,
         height: float = 0.0,
+        no_parking_sign: bool = False,
     ) -> None:
         self.detected = detected
         self.is_open = is_open
@@ -70,6 +74,7 @@ class ParkingSpotDetection:
         self.approach_side = approach_side
         self.width = width
         self.height = height
+        self.no_parking_sign = no_parking_sign
 
 
 class AlignmentCommand:
@@ -84,6 +89,7 @@ class AlignmentCommand:
     ADJUST_CLOSER = "ADJUST_CLOSER"
     ADJUST_FARTHER = "ADJUST_FARTHER"
     LOST_SPOT = "LOST_SPOT"
+    NO_PARKING = "NO_PARKING"
 
 
 class ParkingVisionNode(Node):
@@ -109,6 +115,17 @@ class ParkingVisionNode(Node):
         self.alignment_error_pub = self.create_publisher(
             Twist, "/parking_bot/alignment_error", 10
         )
+        self.no_parking_pub = self.create_publisher(
+            Bool, "/parking_bot/no_parking_detected", 10
+        )
+
+        # Load no parking sign template
+        template_path = "no_parking_sign.jpeg"
+        self.no_parking_template = cv2.imread(template_path, cv2.IMREAD_GRAYSCALE)
+        if self.no_parking_template is None:
+            self.get_logger().error(f"Failed to load no parking sign template from: {template_path}")
+        else:
+            self.get_logger().info(f"Loaded no parking sign template from: {template_path}")
 
         # DepthAI / OAK-D initialization
         self.pipeline = self._create_pipeline()
@@ -138,11 +155,13 @@ class ParkingVisionNode(Node):
         self.TARGET_LATERAL_OFFSET_PX = 100  # Desired lateral distance from spot
         self.LATERAL_TOLERANCE_PX = 30
 
+        # No parking sign detection threshold
+        self.NO_PARKING_THRESHOLD = 0.6  # Adjust based on testing
+
         # Main loop timer (e.g. 20 Hz)
         self.timer = self.create_timer(0.05, self._process_frame)
 
         self.get_logger().info("ParkingVisionNode initialized successfully.")
-
 
     def _create_pipeline(self) -> dai.Pipeline:
         """
@@ -178,31 +197,102 @@ class ParkingVisionNode(Node):
         # Detect parking spot
         spot = self._detect_parking_spot(frame)
 
-        # Publish occupancy as a Bool
+        # Detect no parking sign
+        no_parking_detected = self._detect_no_parking_sign(frame, spot)
+        
+        # Update spot status if no parking sign detected
+        if no_parking_detected:
+            spot.no_parking_sign = True
+            spot.is_open = False  # Mark as unavailable
+
+        # Publish no parking detection status
+        no_parking_msg = Bool()
+        no_parking_msg.data = no_parking_detected
+        self.no_parking_pub.publish(no_parking_msg)
+
+        # Publish occupancy as a Bool (False if no parking sign present)
         open_msg = Bool()
-        open_msg.data = bool(spot.detected and spot.is_open)
+        open_msg.data = bool(spot.detected and spot.is_open and not no_parking_detected)
         self.spot_open_pub.publish(open_msg)
 
         # Compute and publish alignment command
         if spot.detected:
-            alignment_cmd, error = self._compute_alignment(spot, frame.shape)
-            
-            cmd_msg = String()
-            cmd_msg.data = alignment_cmd
-            self.alignment_cmd_pub.publish(cmd_msg)
+            if no_parking_detected:
+                # Don't provide alignment if no parking sign detected
+                cmd_msg = String()
+                cmd_msg.data = AlignmentCommand.NO_PARKING
+                self.alignment_cmd_pub.publish(cmd_msg)
+                self.get_logger().info("No parking sign detected - skipping this spot")
+            else:
+                alignment_cmd, error = self._compute_alignment(spot, frame.shape)
+                
+                cmd_msg = String()
+                cmd_msg.data = alignment_cmd
+                self.alignment_cmd_pub.publish(cmd_msg)
 
-            # Publish alignment error as Twist (linear.x = forward/back, angular.z = rotation)
-            error_msg = Twist()
-            error_msg.linear.x = error[0]   # longitudinal error
-            error_msg.linear.y = error[1]   # lateral error
-            error_msg.angular.z = error[2]  # angular error
-            self.alignment_error_pub.publish(error_msg)
+                # Publish alignment error as Twist (linear.x = forward/back, angular.z = rotation)
+                error_msg = Twist()
+                error_msg.linear.x = error[0]   # longitudinal error
+                error_msg.linear.y = error[1]   # lateral error
+                error_msg.angular.z = error[2]  # angular error
+                self.alignment_error_pub.publish(error_msg)
         else:
             # No spot detected
             cmd_msg = String()
             cmd_msg.data = AlignmentCommand.LOST_SPOT
             self.alignment_cmd_pub.publish(cmd_msg)
 
+    def _detect_no_parking_sign(
+        self, 
+        frame_bgr: np.ndarray, 
+        spot: ParkingSpotDetection
+    ) -> bool:
+        """
+        Detect no parking sign using template matching at multiple scales
+        
+        Returns True if no parking sign is detected
+        """
+        if self.no_parking_template is None:
+            return False
+
+        # Convert frame to grayscale
+        gray_frame = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+
+        # Template matching at multiple scales
+        return self._template_matching(gray_frame, self.no_parking_template)
+
+    def _template_matching(
+        self, 
+        gray_frame: np.ndarray, 
+        template: np.ndarray
+    ) -> bool:
+        """
+        Perform template matching at multiple scales
+        """
+        # Try multiple scales
+        scales = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0]
+        
+        for scale in scales:
+            # Resize template
+            width = int(template.shape[1] * scale)
+            height = int(template.shape[0] * scale)
+            
+            # Skip if template is larger than frame
+            if width > gray_frame.shape[1] or height > gray_frame.shape[0]:
+                continue
+                
+            resized_template = cv2.resize(template, (width, height))
+            
+            # Perform template matching
+            result = cv2.matchTemplate(gray_frame, resized_template, cv2.TM_CCOEFF_NORMED)
+            min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(result)
+            
+            # Check if match exceeds threshold
+            if max_val > self.NO_PARKING_THRESHOLD:
+                self.get_logger().info(f"No parking sign detected (template match: {max_val:.2f} at scale {scale})")
+                return True
+        
+        return False
 
     def _detect_parking_spot(self, frame_bgr: np.ndarray) -> ParkingSpotDetection:
         """
