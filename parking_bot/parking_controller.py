@@ -9,6 +9,7 @@
 #   - Integrates HAL with vision node
 #   - Implements state machine for parking procedure
 #   - Supports forward and reverse parallel parking
+#   - Handles no parking sign detection
 # =============================================================================
 
 """
@@ -19,6 +20,7 @@ This node orchestrates the autonomous parking procedure by:
 - Managing parking state machine
 - Commanding the HAL to execute maneuvers
 - Supporting both forward and reverse parallel parking
+- Avoiding spots with no parking signs
 """
 
 from __future__ import annotations
@@ -77,6 +79,7 @@ class ParkingController(Node):
         # Vision data
         self.spot_is_open = False
         self.spot_detected = False
+        self.no_parking_sign_detected = False
         self.tag_pose: Optional[Pose2D] = None
 
         # Vision data - alignment
@@ -106,6 +109,12 @@ class ParkingController(Node):
             Twist,
             "/parking_bot/alignment_error",
             self._alignment_error_callback,
+            10
+        )
+        self.no_parking_sub = self.create_subscription(
+            Bool,
+            "/parking_bot/no_parking_detected",
+            self._no_parking_callback,
             10
         )
 
@@ -143,6 +152,12 @@ class ParkingController(Node):
             f"Alignment error - Long: {msg.linear.x:.1f}, Lat: {msg.linear.y:.1f}, Ang: {msg.angular.z:.3f}"
         )
 
+    def _no_parking_callback(self, msg: Bool) -> None:
+        """Callback for no parking sign detection"""
+        self.no_parking_sign_detected = msg.data
+        if msg.data:
+            self.get_logger().warn("No parking sign detected - will skip this spot")
+
     def _control_loop(self) -> None:
         """Main control loop - runs state machine"""
         if self.state == ParkingState.IDLE:
@@ -166,6 +181,13 @@ class ParkingController(Node):
 
     def _handle_searching(self) -> None:
         """SEARCHING state - looking for open spot"""
+        if self.no_parking_sign_detected:
+            self.get_logger().warn("Spot has no parking sign - continuing search...")
+            # Continue driving slowly to find another spot
+            self.hal.drive_forward(distance_m=0.2, steering=0.0)
+            time.sleep(0.5)
+            return
+            
         if self.spot_is_open:
             self.get_logger().info("Found open spot! Stopping to align...")
             self.hal.stop()
@@ -173,6 +195,13 @@ class ParkingController(Node):
 
     def _handle_aligning(self) -> None:
         """ALIGNING state - positioning alongside the spot"""
+        # Check for no parking sign during alignment
+        if self.no_parking_sign_detected:
+            self.get_logger().warn("No parking sign detected - aborting alignment")
+            self.hal.stop()
+            self.state = ParkingState.SEARCHING
+            return
+            
         self.get_logger().info("Aligning to side of spot...")
         
         try:
@@ -185,6 +214,11 @@ class ParkingController(Node):
 
     def _handle_pre_parking(self) -> None:
         """PRE_PARKING state - final checks before parking"""
+        if self.no_parking_sign_detected:
+            self.get_logger().warn("No parking sign detected! Aborting")
+            self.state = ParkingState.SEARCHING
+            return
+            
         if not self.spot_is_open:
             self.get_logger().warn("Spot no longer open! Aborting")
             self.state = ParkingState.SEARCHING
@@ -232,6 +266,11 @@ class ParkingController(Node):
         while not aligned and iteration < max_iterations:
             iteration += 1
             
+            # Check for no parking sign
+            if self.no_parking_sign_detected:
+                self.get_logger().warn("No parking sign detected during alignment - aborting")
+                raise Exception("No parking sign detected")
+            
             # Get current alignment command from vision
             cmd = self.alignment_command
             long_err, lat_err, ang_err = self.alignment_error
@@ -245,6 +284,10 @@ class ParkingController(Node):
                 self.get_logger().info("Alignment achieved!")
                 aligned = True
                 break
+            
+            elif cmd == "NO_PARKING":
+                self.get_logger().warn("No parking sign detected - aborting alignment")
+                raise Exception("No parking sign detected")
             
             elif cmd == "LOST_SPOT":
                 self.get_logger().warn("Lost sight of spot during alignment")
@@ -313,22 +356,16 @@ class ParkingController(Node):
         try:
             # Step 1: Go back straight
             self.get_logger().info("Step 1: Backing up straight...")
-            # Original: steering=0.5, throttle=-0.05, time=1.7s
-            # Distance ≈ 0.6 m/s * 1.7s = 1.02m
             self.hal.drive_backward(distance_m=1.02, steering=0.0)
             time.sleep(0.2)
 
             # Step 2: Turn sharp right while going forward
             self.get_logger().info("Step 2: Forward with sharp right turn...")
-            # Original: steering=1.4 (right), throttle=0.062, time=0.74s
-            # Distance ≈ 0.6 m/s * 0.74s = 0.44m
             self.hal.drive_forward(distance_m=0.44, steering=1.0)
             time.sleep(0.2)
 
             # Step 3: Turn left while going forward
             self.get_logger().info("Step 3: Forward with left turn...")
-            # Original: steering=0.0 (left), throttle=0.064, time=0.58s
-            # Distance ≈ 0.6 m/s * 0.58s = 0.35m
             self.hal.drive_forward(distance_m=0.35, steering=-1.0)
             time.sleep(0.2)
 
@@ -361,22 +398,16 @@ class ParkingController(Node):
         try:
             # Step 1: Go forward straight
             self.get_logger().info("Step 1: Going forward...")
-            # Original: steering=0.5, throttle=0.05, time=2.0s
-            # Distance ≈ 0.6 m/s * 2.0s = 1.2m
             self.hal.drive_forward(distance_m=1.2, steering=0.0)
             time.sleep(0.2)
 
             # Step 2: Reverse with sharp right turn
             self.get_logger().info("Step 2: Reversing with right turn...")
-            # Original: steering=1.4 (right), throttle=-0.07, time=0.68s
-            # Distance ≈ 0.6 m/s * 0.68s = 0.41m
             self.hal.drive_backward(distance_m=0.41, steering=1.0)
             time.sleep(0.2)
 
             # Step 3: Reverse with left turn
             self.get_logger().info("Step 3: Reversing with left turn...")
-            # Original: steering=0.0 (left), throttle=-0.062, time=0.58s
-            # Distance ≈ 0.6 m/s * 0.58s = 0.35m
             self.hal.drive_backward(distance_m=0.35, steering=-1.0)
             time.sleep(0.2)
 
