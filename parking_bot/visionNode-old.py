@@ -4,18 +4,19 @@
 #
 # Authors:   Trew Hoffman, Terri Tai
 # Created:     2025-11-26
-# Updated:     2025-1
+# Updated:     2025-11-29
 #
 # Notes:
 #   - This is a ROS2 node that integrates DepthAI (Oak-D), OpenCV, and AprilTag
 #     detection
 #   - Color thresholds and tag size placeholders must be tuned later with real hardware
 #   - Now includes alignment guidance for parallel parking
-#   - Added no parking sign detection using template matching
 # =============================================================================
+
 
 """
 Vision Node
+
 
 This node will:
 - Grab RGB frames from OAK-D
@@ -23,78 +24,69 @@ This node will:
 - Determine "long" and short sides of the spot
 - Perform basic occupancy detection (is there an obstacle)
 - Detect an AprilTag placed near the pre-parking pose
-- Detect no parking signs and mark spots as unavailable
 - Provide alignment guidance for positioning alongside the spot
+
 
 Outputs: ROS Topics
 - /parking_bot/spot_info
 - /parking_bot/tag_pose
 - /parking_bot/spot_open
-- /parking_bot/alignment_command
 - /parking_bot/no_parking_detected
 """
 
+
 from __future__ import annotations
-import math
-from typing import Optional, Tuple
+
+from typing import Optional, Tuple, List
+
 import cv2
 import depthai as dai
 import numpy as np
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import Bool, String
-from geometry_msgs.msg import Pose2D, Twist
+
+from std_msgs.msg import Bool, String, Float32
 
 
-class ApproachSide:
-    UNKNOWN = 0
-    LEFT = -1   # long side / approach from left
-    RIGHT = 1   # long side / approach from right
+class SpotId:
+    UNKNOWN = "UNKNOWN"
+    NEAR = "NEAR"
+    FAR = "FAR"
 
 
 class ParkingSpotDetection:
     """
-    Internal container for parking spot info
+    Container for one parking spot's info.
     """
     def __init__(
         self,
-        detected: bool = False,
-        is_open: bool = True,
+        spotted: bool = False,
+        spot_id: str = SpotId.UNKNOWN,
         center_px: Tuple[int, int] = (0, 0),
-        yaw_rad: float = 0.0,
-        approach_side: int = ApproachSide.UNKNOWN,
-        width: float = 0.0,
-        height: float = 0.0,
-        no_parking_sign: bool = False,
+        width_px: float = 0.0,
+        height_px: float = 0.0,
+        is_open: bool = True,
+        has_no_parking_sign: bool = False,
+        has_obstacle: bool = False,
+        distance_m: float = 0.0,
+        rect_box_points: np.ndarray | None = None,
     ) -> None:
-        self.detected = detected
-        self.is_open = is_open
+        self.spotted = spotted
+        self.spot_id = spot_id
         self.center_px = center_px
-        self.yaw_rad = yaw_rad
-        self.approach_side = approach_side
-        self.width = width
-        self.height = height
-        self.no_parking_sign = no_parking_sign
-
-
-class AlignmentCommand:
-    """
-    Alignment command types
-    """
-    ALIGNED = "ALIGNED"
-    MOVE_FORWARD = "MOVE_FORWARD"
-    MOVE_BACKWARD = "MOVE_BACKWARD"
-    TURN_LEFT = "TURN_LEFT"
-    TURN_RIGHT = "TURN_RIGHT"
-    ADJUST_CLOSER = "ADJUST_CLOSER"
-    ADJUST_FARTHER = "ADJUST_FARTHER"
-    LOST_SPOT = "LOST_SPOT"
-    NO_PARKING = "NO_PARKING"
+        self.width_px = width_px
+        self.height_px = height_px
+        self.is_open = is_open
+        self.has_no_parking_sign = has_no_parking_sign
+        self.has_obstacle = has_obstacle
+        self.distance_m = distance_m
+        self.rect_box_points = rect_box_points  # 4x2 array of box points (int)
 
 
 class ParkingVisionNode(Node):
     """
-    ROS2 node that handles vision
+    ROS2 node that detects two parallel parking spots on the right and
+    publishes which spot is available and the distance to it.
     """
 
     def __init__(self) -> None:
@@ -102,84 +94,112 @@ class ParkingVisionNode(Node):
 
         self.get_logger().info("Initializing ParkingVisionNode...")
 
-        # Publishers
-        self.spot_open_pub = self.create_publisher(
-            Bool, "/parking_bot/spot_open", 10
+        # ---------------------------------------------------------------------
+        # Publishers for orchestrator
+        # ---------------------------------------------------------------------
+        self.near_spot_open_pub = self.create_publisher(
+            Bool, "/parking_bot/near_spot_open", 10
         )
-        self.tag_pose_pub = self.create_publisher(
-            Pose2D, "/parking_bot/tag_pose", 10
-        )
-        self.alignment_cmd_pub = self.create_publisher(
-            String, "/parking_bot/alignment_command", 10
-        )
-        self.alignment_error_pub = self.create_publisher(
-            Twist, "/parking_bot/alignment_error", 10
-        )
-        self.no_parking_pub = self.create_publisher(
-            Bool, "/parking_bot/no_parking_detected", 10
+        self.far_spot_open_pub = self.create_publisher(
+            Bool, "/parking_bot/far_spot_open", 10
         )
 
-        # Load no parking sign template
+        self.near_spot_distance_pub = self.create_publisher(
+            Float32, "/parking_bot/near_spot_distance_m", 10
+        )
+        self.far_spot_distance_pub = self.create_publisher(
+            Float32, "/parking_bot/far_spot_distance_m", 10
+        )
+
+        self.near_no_parking_pub = self.create_publisher(
+            Bool, "/parking_bot/near_no_parking_sign", 10
+        )
+        self.far_no_parking_pub = self.create_publisher(
+            Bool, "/parking_bot/far_no_parking_sign", 10
+        )
+
+        self.near_obstacle_pub = self.create_publisher(
+            Bool, "/parking_bot/near_obstacle", 10
+        )
+        self.far_obstacle_pub = self.create_publisher(
+            Bool, "/parking_bot/far_obstacle", 10
+        )
+
+        # Main orchestrator topics:
+        self.open_spot_id_pub = self.create_publisher(
+            String, "/parking_bot/open_spot_id", 10
+        )
+        self.open_spot_distance_pub = self.create_publisher(
+            Float32, "/parking_bot/open_spot_distance_m", 10
+        )
+
+        # No parking sign template
         template_path = "no_parking_sign.jpeg"
         self.no_parking_template = cv2.imread(template_path, cv2.IMREAD_GRAYSCALE)
         if self.no_parking_template is None:
-            self.get_logger().error(f"Failed to load no parking sign template from: {template_path}")
+            self.get_logger().error(
+                f"Failed to load no parking sign template from: {template_path}"
+            )
         else:
-            self.get_logger().info(f"Loaded no parking sign template from: {template_path}")
+            self.get_logger().info(
+                f"Loaded no parking sign template from: {template_path}"
+            )
 
-        # DepthAI / OAK-D initialization
+        self.NO_PARKING_THRESHOLD = 0.6
+
+        # DepthAI / OAK-D setup: RGB + stereo depth aligned to RGB
         self.pipeline = self._create_pipeline()
         self.device = dai.Device(self.pipeline)
 
-        # Get RGB output queue
-        self.q_rgb = self.device.getOutputQueue(name="rgb", maxSize=4, blocking=False)
+        # Queues
+        self.q_rgb = self.device.getOutputQueue(
+            name="rgb", maxSize=4, blocking=False
+        )
+        self.q_depth = self.device.getOutputQueue(
+            name="depth", maxSize=4, blocking=False
+        )
 
-        # Camera intrinsics
-        # Attempts to grab values from camera config, otherwise estimates from known values
-        try: 
-            calib = self.device.readCalibration()
-            intr = calib.getCameraIntrinsics(dai.CameraBoardSocket.RGB, 640, 480)
-            self.fx = intr[0][0]
-            self.fy = intr[1][1]
-            self.cx = intr[0][2]
-            self.cy = intr[1][2]
-        except Exception as e: 
-            self.fx = 3009.0 # focal length / pixel size
-            self.fy = 3009.0 # focal length / pixel size
-            self.cx = 320.0 # Principal x-coordinate, x-pixels/2
-            self.cy = 240.0 # Principal y coordinate, y-pixels/2
-
-        # Alignment thresholds (need to tune these with hardware!)
-        self.ALIGNMENT_TOLERANCE_PX = 50  # How close to center is "aligned"
-        self.ANGLE_TOLERANCE_RAD = 0.1    # ~5.7 degrees
-        self.TARGET_LATERAL_OFFSET_PX = 100  # Desired lateral distance from spot
-        self.LATERAL_TOLERANCE_PX = 30
-
-        # No parking sign detection threshold
-        self.NO_PARKING_THRESHOLD = 0.6  # Adjust based on testing
-
-        # Main loop timer (e.g. 20 Hz)
+        # Main processing timer (20 Hz)
         self.timer = self.create_timer(0.05, self._process_frame)
 
         self.get_logger().info("ParkingVisionNode initialized successfully.")
 
+    # DepthAI pipeline: ColorCamera + Mono + StereoDepth aligned to RGB
     def _create_pipeline(self) -> dai.Pipeline:
-        """
-        Helper to create a simple RGB pipeline for the OAK-D
-        """
         pipeline = dai.Pipeline()
 
+        # RGB camera
         cam_rgb = pipeline.create(dai.node.ColorCamera)
-        xout_rgb = pipeline.create(dai.node.XLinkOut)
-
-        xout_rgb.setStreamName("rgb")
-
         cam_rgb.setPreviewSize(640, 480)
         cam_rgb.setInterleaved(False)
         cam_rgb.setColorOrder(dai.ColorCameraProperties.ColorOrder.BGR)
         cam_rgb.setFps(30)
 
+        # Mono cameras for stereo
+        mono_left = pipeline.create(dai.node.MonoCamera)
+        mono_right = pipeline.create(dai.node.MonoCamera)
+        mono_left.setResolution(dai.MonoCameraProperties.SensorResolution.THE_400_P)
+        mono_right.setResolution(dai.MonoCameraProperties.SensorResolution.THE_400_P)
+        mono_left.setBoardSocket(dai.CameraBoardSocket.LEFT)
+        mono_right.setBoardSocket(dai.CameraBoardSocket.RIGHT)
+
+        # Stereo depth
+        stereo = pipeline.create(dai.node.StereoDepth)
+        stereo.setDefaultProfilePreset(dai.node.StereoDepth.PresetMode.HIGH_DENSITY)
+        stereo.setDepthAlign(dai.CameraBoardSocket.RGB)  # align depth to RGB
+        stereo.setSubpixel(False)  # you can turn this on if you want subpixel depth
+
+        mono_left.out.link(stereo.left)
+        mono_right.out.link(stereo.right)
+
+        # Outputs
+        xout_rgb = pipeline.create(dai.node.XLinkOut)
+        xout_rgb.setStreamName("rgb")
         cam_rgb.preview.link(xout_rgb.input)
+
+        xout_depth = pipeline.create(dai.node.XLinkOut)
+        xout_depth.setStreamName("depth")
+        stereo.depth.link(xout_depth.input)
 
         return pipeline
 
@@ -359,7 +379,7 @@ class ParkingVisionNode(Node):
         detection.height = bh
 
         # If angle is between -45 and +45 deg, we say approach from "bottom"
-        # and map that to RIGHT or LEFT 
+        # and map that to RIGHT or LEFT
         # pick RIGHT if angle is roughly horizontal
         norm_angle = (angle_deg + 180.0) % 180.0  # [0, 180)
         if 45.0 <= norm_angle <= 135.0:
@@ -397,75 +417,6 @@ class ParkingVisionNode(Node):
 
         return detection
 
-    def _compute_alignment(
-        self, 
-        spot: ParkingSpotDetection, 
-        frame_shape: Tuple[int, int, int]
-    ) -> Tuple[str, Tuple[float, float, float]]:
-        """
-        Compute alignment command based on spot position relative to camera.
-        
-        For parallel parking, we want to:
-        1. Be alongside the spot (lateral alignment)
-        2. Be at the correct longitudinal position (front/back)
-        3. Be parallel to the spot (angular alignment)
-        
-        Returns:
-            (alignment_command, (longitudinal_error, lateral_error, angular_error))
-        """
-        h, w, _ = frame_shape
-        frame_center_x = w / 2
-        frame_center_y = h / 2
-        
-        spot_x, spot_y = spot.center_px
-        
-        # Compute errors
-        # Longitudinal: how far forward/back the spot is from frame center
-        longitudinal_error = spot_y - frame_center_y  # positive = spot is below center
-        
-        # Lateral: how far left/right the spot is from desired offset
-        # For parallel parking, we want the spot to be offset to one side
-        lateral_error = spot_x - (frame_center_x + self.TARGET_LATERAL_OFFSET_PX)
-        
-        # Angular: how parallel we are to the spot
-        angular_error = spot.yaw_rad  # 0 = parallel, non-zero = need rotation
-        
-        # Normalize angular error to [-pi, pi]
-        while angular_error > math.pi:
-            angular_error -= 2 * math.pi
-        while angular_error < -math.pi:
-            angular_error += 2 * math.pi
-        
-        # Decision logic
-        # Priority: 1) Angular alignment, 2) Lateral position, 3) Longitudinal position
-        
-        # Check if angular alignment is off
-        if abs(angular_error) > self.ANGLE_TOLERANCE_RAD:
-            if angular_error > 0:
-                return AlignmentCommand.TURN_RIGHT, (longitudinal_error, lateral_error, angular_error)
-            else:
-                return AlignmentCommand.TURN_LEFT, (longitudinal_error, lateral_error, angular_error)
-        
-        # Check lateral position (distance from spot)
-        if abs(lateral_error) > self.LATERAL_TOLERANCE_PX:
-            if lateral_error > 0:
-                # Spot is too far right, need to move closer (left)
-                return AlignmentCommand.ADJUST_CLOSER, (longitudinal_error, lateral_error, angular_error)
-            else:
-                # Spot is too far left, need to move farther (right)
-                return AlignmentCommand.ADJUST_FARTHER, (longitudinal_error, lateral_error, angular_error)
-        
-        # Check longitudinal position
-        if abs(longitudinal_error) > self.ALIGNMENT_TOLERANCE_PX:
-            if longitudinal_error > 0:
-                # Spot is below center, need to move forward
-                return AlignmentCommand.MOVE_FORWARD, (longitudinal_error, lateral_error, angular_error)
-            else:
-                # Spot is above center, need to move backward
-                return AlignmentCommand.MOVE_BACKWARD, (longitudinal_error, lateral_error, angular_error)
-        
-        # If we're here, we're aligned!
-        return AlignmentCommand.ALIGNED, (longitudinal_error, lateral_error, angular_error)
 
 
 # ROS2 entry point

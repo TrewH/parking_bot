@@ -50,9 +50,9 @@ class SweeperServo:
     # ------------------------------------------------------------------
     def set_angle(self, angle):
         """
-        Sets the servo to a specific angle. Safe clamped 0–180°.
+
         """
-        angle = max(0, min(180, angle))
+        angle = angle
         self.servo.angle = angle
         self.current_angle = angle
         print(f"[Servo] Set angle → {angle}°")
@@ -67,7 +67,7 @@ class SweeperServo:
         print("[Servo] Starting home-based 180° sweep")
 
         start = int(self.home_angle)
-        end = int(min(self.home_angle + 180, 180))  # clamp max to 180°
+        end = self.home_angle + 180  # clamp max to 180°
 
         # Sweep forward
         for a in range(start, end + 1, 2):
