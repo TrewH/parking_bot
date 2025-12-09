@@ -225,6 +225,27 @@ def main(args=None) -> None:
                 node.parallel_park_left(hal)
             else:
                 node.get_logger().error(f"Unexpected side '{side}', aborting.")
+                
+    # # For sweeper
+    # dist, side, has_obstacle = node.get_best_spot_position() # Update to unpack 3 values
+
+    #         if dist is not None:
+    #             # DRIVE TO POSITION FIRST
+    #             node.get_logger().info(f"Driving forward {dist:.2f} m...")
+    #             hal.set_steering(0.5)
+    #             hal.drive(dist)
+    #             time.sleep(PAUSE_BETWEEN_MOVES_S)
+
+    #     # CHECK OBSTACLE
+    #         if has_obstacle:
+    #             node.get_logger().warn("Obstacle reported! Deploying sweeper...")
+    #             node.trigger_sweeper()
+    #  # Optional: Move slightly to ensure clearance if needed
+    
+    # # NOW PARK
+    # if side == "right":
+    #      node.parallel_park_right(hal)
+    
     finally:
         # Clean shutdown of HAL and ROS
         try:
