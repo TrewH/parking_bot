@@ -27,11 +27,18 @@ class Orchestrator(Node):
         # Service client for the vision node
         self.cli = self.create_client(Trigger, 'get_parking_spots')
         self.get_logger().info('Waiting for /get_parking_spots service...')
+        time.sleep(2)
 
         while not self.cli.wait_for_service(timeout_sec=1.0):
             self.get_logger().info('Service not available, waiting again...')
 
         self.get_logger().info('Service is available.')
+
+        # Iterative depth-correction mode (set via ROS param)
+        #   ros2 run ... --ros-args -p iterative:=true
+        param = self.declare_parameter('iterative', True)
+        self.iterative: bool = param.value
+        self.get_logger().info(f'Iterative mode: {self.iterative}')
 
     # ------------------------------------------------------------------
     # Service interaction
@@ -47,7 +54,6 @@ class Orchestrator(Node):
         request = Trigger.Request()
         future = self.cli.call_async(request)
 
-        self.get_logger().info('Calling /get_parking_spots...')
         rclpy.spin_until_future_complete(self, future)
 
         if future.result() is None:
@@ -60,7 +66,7 @@ class Orchestrator(Node):
         )
 
         if not response.success:
-            self.get_logger().warn(f"Vision node reported failure: {response.message}")
+            self.get_logger().warning(f"Vision node reported failure: {response.message}")
             return None, None
 
         distance_m, side = self._parse_message(response.message)
@@ -68,7 +74,6 @@ class Orchestrator(Node):
             self.get_logger().error("Failed to parse response.message for side/depth.")
             return None, None
 
-        self.get_logger().info(f"Best spot: side={side}, distance_m={distance_m:.2f}")
         return distance_m, side
 
     # ------------------------------------------------------------------
@@ -87,21 +92,20 @@ class Orchestrator(Node):
 
         # Reverse 1
         hal.set_steering(1.0)
-        hal.drive(-0.45)
+        hal.drive(-0.425)
         time.sleep(PAUSE_BETWEEN_MOVES_S)
 
         # Reverse 2
         hal.set_steering(0.0)
-        hal.drive(-0.49)
+        hal.drive(-0.465)
         time.sleep(PAUSE_BETWEEN_MOVES_S)
 
         # Forward 2
         hal.set_steering(0.5)
-        hal.drive(0.18)
+        hal.drive(0.125)
         time.sleep(PAUSE_BETWEEN_MOVES_S)
 
         hal.stop()
-        self.get_logger().info("=== RIGHT parallel park complete ===")
 
     def parallel_park_left(self, hal: ParkingHAL) -> None:
         """
@@ -130,7 +134,6 @@ class Orchestrator(Node):
         time.sleep(PAUSE_BETWEEN_MOVES_S)
 
         hal.stop()
-        self.get_logger().info("=== LEFT parallel park complete ===")
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -179,25 +182,70 @@ def main(args=None) -> None:
     node.get_logger().info("HAL and Orchestrator running")
 
     try:
-        # One-shot service call + maneuver
+        ok = True
+
+        # First measurement
         dist, side = node.get_best_spot_position()
+
+        # Subtract space between apriltag and spots
+        dist = dist - 0.38
 
         if dist is None or side is None:
             node.get_logger().error("No valid best spot returned; aborting.")
+            ok = False
         else:
-            # 1) Drive straight up to the spot
-            node.get_logger().info(f"Driving forward {dist:.2f} m toward the spot...")
+            # -------------------------------
+            # Iterative depth correction step
+            # -------------------------------
+            if node.iterative and dist > 3.0:
+                approach = dist - 2.0
+                node.get_logger().info(
+                    f"Iterative mode: initial distance {dist:.2f} m > 1.0 m; "
+                    f"driving {approach:.2f} m to get to ~1.0 m, then re-measuring."
+                )
+
+                hal.set_steering(0.5)
+                approach = approach # (distance from spots to apriltag)
+                hal.drive(approach)
+                time.sleep(PAUSE_BETWEEN_MOVES_S)
+
+                # Second measurement at ~1 m
+                dist2, side2 = node.get_best_spot_position()
+                if dist2 is None or side2 is None:
+                    node.get_logger().error(
+                        "Second measurement failed in iterative mode; aborting."
+                    )
+                    ok = False
+                else:
+                    dist, side = dist2, side2
+                    node.get_logger().info(
+                        f"Iterative mode: updated distance={dist:.2f} m, side={side}"
+                    )
+
+        # ---------------------------------
+        # Final approach + parallel parking
+        # ---------------------------------
+        if ok and dist is not None and side is not None:
+            node.get_logger().info(
+                f"Driving forward {dist:.2f} m toward the spot..."
+            )
             hal.set_steering(0.5)
             hal.drive(dist)
             time.sleep(PAUSE_BETWEEN_MOVES_S)
+
+            # Move apriltag between sequences
+            node.get_logger().warning("Please move the AprilTag: Parallel parking in 5s")
+            time.sleep(5)
 
             # Fixed parallel parking
             if side == "right":
                 node.get_logger().info("Calling parallel_park_right()")
                 node.parallel_park_right(hal)
+                node.get_logger().info("=== Finished RIGHT parallel park ===")
             elif side == "left":
                 node.get_logger().info("Calling parallel_park_left()")
                 node.parallel_park_left(hal)
+                node.get_logger().info("=== Finished LEFT parallel park ===")
             else:
                 node.get_logger().error(f"Unexpected side '{side}', aborting.")
     finally:
@@ -205,7 +253,7 @@ def main(args=None) -> None:
         try:
             hal.shutdown()
         except Exception as e:
-            node.get_logger().warn(f"Error during HAL shutdown: {e}")
+            node.get_logger().warning(f"Error during HAL shutdown: {e}")
 
         node.destroy_node()
         rclpy.shutdown()

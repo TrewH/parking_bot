@@ -18,17 +18,17 @@ def park_right():
 
     # Reverse 1
     hal.set_steering(1.0)
-    hal.drive(-0.45)
+    hal.drive(-0.425)
     time.sleep(0.5)
 
     # Reverse 2
     hal.set_steering(0.0)
-    hal.drive(-0.49)
+    hal.drive(-0.465)
     time.sleep(0.5)
 
     # Forward 2
     hal.set_steering(0.5)
-    hal.drive(0.18)
+    hal.drive(0.125)
     time.sleep(0.5)
 
     hal.shutdown()

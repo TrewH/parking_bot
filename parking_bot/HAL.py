@@ -124,8 +124,6 @@ class ParkingHAL:
         target_counts = abs(distance_m) / self.DIST_PER_TACH
 
         start_tach = self._get_tach()
-        print(f"[HAL] drive(): distance={distance_m}, direction={direction}")
-        print(f"[HAL] drive(): start_tach={start_tach}, target_counts={target_counts}")
 
         # Safety timeout (seconds)
         max_time_s = 10.0
@@ -133,7 +131,6 @@ class ParkingHAL:
 
         # Turn on motor
         self._set_duty(direction * self.DUTY_CYCLE)
-        print(f"[HAL] drive(): set duty = {direction * self.DUTY_CYCLE}")
 
         try:
             while True:
@@ -141,28 +138,24 @@ class ParkingHAL:
                 delta_counts = (current_tach - start_tach) * direction
 
                 elapsed = time.time() - start_time
-                print(f"[HAL] drive(): {current_tach}/{target_counts}, "
-                    f"elapsed={elapsed:.2f}s")
 
                 if delta_counts >= target_counts:
-                    print("[HAL] drive(): reached target counts, stopping")
+                    print("[HAL] drive(): reached target counts, stopping", flush=True)
                     break
 
                 if elapsed > max_time_s:
-                    print("[HAL] drive(): TIMEOUT, stopping to avoid infinite loop")
+                    print("[HAL] drive(): TIMEOUT, stopping to avoid infinite loop", flush=True)
                     break
 
                 printing_counter = printing_counter + 1
 
-                if printing_counter % 10 == 0:
-                    print(f"[HAL] drive(): {current_tach}/{target_counts}, "
-                    f"elapsed={elapsed:.2f}s")
+                if printing_counter % 100 == 0:
+                    print(f"[HAL] drive(): {delta_counts}/{target_counts}, "
+                    f"elapsed={elapsed:.2f}s", flush=True)
 
                 time.sleep(period)
         finally:
             self.stop()
-            print("[HAL] drive(): stop() called")
-
 
     def shutdown(self) -> None:
         """
