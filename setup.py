@@ -1,4 +1,5 @@
 from setuptools import setup, find_packages
+import os
 
 package_name = 'parking_bot'
 
@@ -10,6 +11,9 @@ setup(
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
+        (os.path.join('share', package_name, 'launch'), [
+            'launch/parking_bot.launch.py'
+        ]),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
@@ -21,7 +25,6 @@ setup(
     entry_points={
         'console_scripts': [
             'vision_node = parking_bot.vision_node:main',
-            'test_parking_client = parking_bot.test_parking_client:main',
             "orchestrator = parking_bot.orchestrator:main",
         ],
     },

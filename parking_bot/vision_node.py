@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 
-from dataclasses import dataclass
 from typing import List, Tuple, Optional
 
 import cv2
@@ -13,35 +12,36 @@ from example_interfaces.srv import Trigger
 Point = Tuple[int, int]
 
 
-@dataclass
-class ParkingSpotResult:
-    corners: List[Point]          # 4 points in image space
-    center: Point                 # (cx, cy)
-    has_no_parking_sign: bool
-    has_obstacle: bool
-    depth_m: Optional[float]      # distance at center in meters
-
-
 class ParkingVisionNode(Node):
     """
     ROS2 node that:
+
       - Connects to an OAK-D camera
-      - Gets RGB, mono-left, mono-right, and depth frames
-      - Detects two parking spots (blue tape rectangles)
-      - Checks for a red "NO PARKING" sign and white obstacle inside each
-      - Chooses the best spot according to:
-          * If one has a NO PARKING sign and the other is empty → choose the empty one
-          * If one has an obstacle and the other has a NO PARKING sign → choose the obstacle
-          * If both are empty → choose the right-most spot
+      - Gets RGB and depth frames
+      - Detects:
+          * Parking spots (blue tape rectangles)
+          * Vertical blue lines near the middle of the image
+          * Red "no parking" region (circle-ish + fallback red imbalance)
+
+    Core behavior:
+
+      - Depth is ALWAYS measured at the midpoint between the two vertical
+        blue lines closest to the middle of the screen (inner tape lines).
+      - Independently of parking spot detection, it will:
+          * Try to detect a NO PARKING sign by looking for a red circular-ish
+            region (circle + line style).
+          * If that fails, fall back to comparing red pixel counts on the
+            left vs right halves of the image.
+          * The service ALWAYS returns the OPPOSITE side of the detected
+            no-parking region, if it exists.
+      - If FEWER than two parking spots are detected, we still compute depth
+        and still run sign detection, but we log a ROS ERROR.
+      - If NO sign is detected (neither circle nor red imbalance), we log a
+        ROS ERROR and default the side.
     """
 
     def __init__(self) -> None:
         super().__init__("parking_vision_node")
-
-        # Optional: template image for NO PARKING sign (grayscale)
-        self.sign_template_gray: Optional[np.ndarray] = cv2.imread(
-            'no_parking_sign.jpeg', cv2.IMREAD_GRAYSCALE
-        )
 
         # Build pipeline and connect to device
         self.pipeline = self._create_pipeline()
@@ -53,7 +53,7 @@ class ParkingVisionNode(Node):
         self.q_mono_left = self.device.getOutputQueue(name="mono_left", maxSize=1, blocking=True)
         self.q_mono_right = self.device.getOutputQueue(name="mono_right", maxSize=1, blocking=True)
 
-        # Service: one-shot parking spot detection
+        # Service: one-shot detection
         self.srv = self.create_service(
             Trigger,
             "get_parking_spots",
@@ -125,161 +125,8 @@ class ParkingVisionNode(Node):
         return frame_bgr, depth_frame
 
     # -------------------------------------------------------------------------
-    # Parking spot detection & analysis
+    # Basic utility
     # -------------------------------------------------------------------------
-    def detect_parking_spots_bgr(self, frame_bgr: np.ndarray) -> List[List[Point]]:
-        """
-        Detects parking spots outlined in blue tape.
-        Returns a list of spots, each spot is a list of 4 (x, y) corner points.
-        Spots are sorted left-to-right by center x.
-        """
-        hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
-
-        BLUE_LOWER = np.array([85, 55,  70])
-        BLUE_UPPER = np.array([110, 255, 255])
-
-        blue_mask = cv2.inRange(hsv, BLUE_LOWER, BLUE_UPPER)
-
-        # Clean up mask a bit
-        kernel = np.ones((5, 5), np.uint8)
-        blue_mask = cv2.morphologyEx(blue_mask, cv2.MORPH_CLOSE, kernel)
-        blue_mask = cv2.morphologyEx(blue_mask, cv2.MORPH_OPEN, kernel)
-
-        contours, _ = cv2.findContours(blue_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-        spots: List[List[Point]] = []
-        h, w = frame_bgr.shape[:2]
-        min_area = (w * h) * 0.01      # tweak: min area as fraction of image
-        max_area = (w * h) * 0.4       # tweak: max area
-
-        for cnt in contours:
-            area = cv2.contourArea(cnt)
-            if area < min_area or area > max_area:
-                continue
-
-            # Polygon approximation
-            peri = cv2.arcLength(cnt, True)
-            approx = cv2.approxPolyDP(cnt, 0.02 * peri, True)
-
-            # We want rectangles (4 corners)
-            if len(approx) != 4:
-                continue
-
-            # Optionally enforce rectangularity by checking bounding box ratio
-            rect = cv2.minAreaRect(cnt)
-            (cx, cy), (w_rect, h_rect), angle = rect
-            if w_rect == 0 or h_rect == 0:
-                continue
-            aspect_ratio = max(w_rect, h_rect) / min(w_rect, h_rect)
-            if aspect_ratio < 0.5 or aspect_ratio > 4.0:
-                continue
-
-            corners = [(int(p[0][0]), int(p[0][1])) for p in approx]
-            spots.append(corners)
-
-        # If more than 2 are found, keep the two largest by area
-        if len(spots) > 2:
-            def spot_area(corners: List[Point]) -> float:
-                cnt = np.array(corners).reshape(-1, 1, 2)
-                return cv2.contourArea(cnt)
-
-            spots = sorted(spots, key=spot_area, reverse=True)[:2]
-
-        # Sort left-to-right by center x
-        def spot_center_x(corners: List[Point]) -> float:
-            xs = [p[0] for p in corners]
-            return float(sum(xs)) / len(xs)
-
-        spots = sorted(spots, key=spot_center_x)
-
-        return spots
-
-    def analyze_spot(
-        self,
-        frame_bgr: np.ndarray,
-        corners: List[Point],
-        sign_template_gray: Optional[np.ndarray] = None,
-        sign_template_thresh: float = 0.6,
-    ) -> Tuple[bool, bool]:
-        """
-        Given the frame and 4 corners of a parking spot,
-        returns (has_no_parking_sign, has_obstacle).
-        Uses color + optional template matching.
-        """
-        h, w = frame_bgr.shape[:2]
-
-        # Create mask for the polygon
-        mask = np.zeros((h, w), dtype=np.uint8)
-        pts = np.array(corners, dtype=np.int32).reshape((-1, 1, 2))
-        cv2.fillPoly(mask, [pts], 255)
-
-        # Shrink mask a bit to avoid including blue borders
-        kernel = np.ones((15, 15), np.uint8)  # tweak size
-        mask_eroded = cv2.erode(mask, kernel, iterations=1)
-
-        # Extract ROI using the mask
-        hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
-
-        # --- Red detection (NO PARKING sign) ---
-        RED1_LOWER = np.array([0,   100, 80])
-        RED1_UPPER = np.array([10,  255, 255])
-        RED2_LOWER = np.array([170, 100, 80])
-        RED2_UPPER = np.array([180, 255, 255])
-
-        red_mask1 = cv2.inRange(hsv, RED1_LOWER, RED1_UPPER)
-        red_mask2 = cv2.inRange(hsv, RED2_LOWER, RED2_UPPER)
-        red_mask = cv2.bitwise_or(red_mask1, red_mask2)
-
-        red_mask_spot = cv2.bitwise_and(red_mask, red_mask, mask=mask_eroded)
-
-        red_pixels = cv2.countNonZero(red_mask_spot)
-        spot_pixels = cv2.countNonZero(mask_eroded)
-        red_ratio = red_pixels / spot_pixels if spot_pixels > 0 else 0.0
-
-        HAS_SIGN_BY_COLOR = red_ratio > 0.10  # tweak threshold
-
-        # Optional template matching for extra confidence
-        HAS_SIGN_BY_TEMPLATE = False
-        if sign_template_gray is not None:
-            x, y, w_box, h_box = cv2.boundingRect(pts)
-            roi_bgr = frame_bgr[y:y+h_box, x:x+w_box]
-            roi_gray = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2GRAY)
-
-            roi_mask = mask_eroded[y:y+h_box, x:x+w_box]
-            roi_gray_masked = roi_gray.copy()
-            roi_gray_masked[roi_mask == 0] = 0
-
-            res = cv2.matchTemplate(roi_gray_masked, sign_template_gray, cv2.TM_CCOEFF_NORMED)
-            _, max_val, _, _ = cv2.minMaxLoc(res)
-            HAS_SIGN_BY_TEMPLATE = max_val > sign_template_thresh
-
-        has_sign = HAS_SIGN_BY_COLOR or HAS_SIGN_BY_TEMPLATE
-
-        # --- White obstacle detection ---
-        WHITE_LOWER = np.array([0,   0,   180])
-        WHITE_UPPER = np.array([180, 60,  255])
-
-        white_mask = cv2.inRange(hsv, WHITE_LOWER, WHITE_UPPER)
-        white_mask_spot = cv2.bitwise_and(white_mask, white_mask, mask=mask_eroded)
-
-        # Remove red region from white (if sign has white text etc.)
-        white_mask_spot = cv2.bitwise_and(
-            white_mask_spot,
-            cv2.bitwise_not(red_mask_spot)
-        )
-
-        contours, _ = cv2.findContours(white_mask_spot, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        max_area = 0.0
-        for cnt in contours:
-            a = cv2.contourArea(cnt)
-            if a > max_area:
-                max_area = a
-
-        white_ratio = max_area / spot_pixels if spot_pixels > 0 else 0.0
-        has_obstacle = white_ratio > 0.02  # tweak threshold (~2% area)
-
-        return has_sign, has_obstacle
-
     def get_depth_at_pixel(
         self,
         depth_frame: np.ndarray,
@@ -318,182 +165,380 @@ class ParkingVisionNode(Node):
         median_mm = float(np.median(valid))
         return median_mm / 1000.0  # mm -> m
 
-    def process_frame(
+    # -------------------------------------------------------------------------
+    # Blue detection: spots and vertical lines
+    # -------------------------------------------------------------------------
+    def _blue_mask(self, frame_bgr: np.ndarray) -> np.ndarray:
+        """Return cleaned-up binary mask of blue tape."""
+        hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
+
+        BLUE_LOWER = np.array([85, 66,  40])
+        BLUE_UPPER = np.array([127, 255, 255])
+
+        mask = cv2.inRange(hsv, BLUE_LOWER, BLUE_UPPER)
+
+        kernel = np.ones((5, 5), np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+
+        return mask
+
+    def detect_parking_spots_bgr(self, frame_bgr: np.ndarray) -> List[List[Point]]:
+        """
+        Detects parking spots outlined in blue tape as rectangles.
+        Returns a list of spots, each spot is a list of 4 (x, y) corner points.
+        Spots are sorted left-to-right by center x.
+        """
+        blue_mask = self._blue_mask(frame_bgr)
+        contours, _ = cv2.findContours(blue_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        spots: List[List[Point]] = []
+        h, w = frame_bgr.shape[:2]
+        min_area = (w * h) * 0.01      # tweak: min area as fraction of image
+        max_area = (w * h) * 0.4       # tweak: max area
+
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            if area < min_area or area > max_area:
+                continue
+
+            # Polygon approximation
+            peri = cv2.arcLength(cnt, True)
+            approx = cv2.approxPolyDP(cnt, 0.02 * peri, True)
+
+            # We want rectangles (4 corners)
+            if len(approx) != 4:
+                continue
+
+            rect = cv2.minAreaRect(cnt)
+            (_, _), (w_rect, h_rect), _ = rect
+            if w_rect == 0 or h_rect == 0:
+                continue
+            aspect_ratio = max(w_rect, h_rect) / min(w_rect, h_rect)
+            if aspect_ratio < 0.5 or aspect_ratio > 4.0:
+                continue
+
+            corners = [(int(p[0][0]), int(p[0][1])) for p in approx]
+            spots.append(corners)
+
+        # If more than 2 are found, keep the two largest by area
+        if len(spots) > 2:
+            def spot_area(corners: List[Point]) -> float:
+                cnt = np.array(corners).reshape(-1, 1, 2)
+                return cv2.contourArea(cnt)
+
+            spots = sorted(spots, key=spot_area, reverse=True)[:2]
+
+        # Sort left-to-right by center x
+        def spot_center_x(corners: List[Point]) -> float:
+            xs = [p[0] for p in corners]
+            return float(sum(xs)) / len(xs)
+
+        spots = sorted(spots, key=spot_center_x)
+
+        return spots
+
+    def find_inner_blue_lines(
+        self,
+        frame_bgr: np.ndarray
+    ) -> Tuple[Optional[int], Optional[int]]:
+        """
+        Find two vertical blue lines closest to the vertical middle of the image
+        (inner edges of the two parking spots).
+
+        Returns:
+            (left_x, right_x) where each is the x-coordinate of a line center,
+            or None if not found on that side.
+        """
+        blue_mask = self._blue_mask(frame_bgr)
+        contours, _ = cv2.findContours(blue_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        h, w = blue_mask.shape[:2]
+        mid_x = w // 2
+
+        # Collect candidate vertical-ish blue strips as their center x positions
+        candidate_xs: List[int] = []
+        for cnt in contours:
+            x, y, w_rect, h_rect = cv2.boundingRect(cnt)
+
+            # Require it to be reasonably tall to be a vertical line segment.
+            if h_rect < 0.3 * h:
+                continue
+
+            center_x = x + w_rect // 2
+            candidate_xs.append(center_x)
+
+        if not candidate_xs:
+            return None, None
+
+        left_x: Optional[int] = None
+        right_x: Optional[int] = None
+
+        # Pick closest candidate left of mid, and right of mid
+        left_candidates = [cx for cx in candidate_xs if cx <= mid_x]
+        right_candidates = [cx for cx in candidate_xs if cx >= mid_x]
+
+        if left_candidates:
+            left_x = min(left_candidates, key=lambda cx: abs(mid_x - cx))
+        if right_candidates:
+            right_x = min(right_candidates, key=lambda cx: abs(mid_x - cx))
+
+        return left_x, right_x
+
+    def get_midpoint_depth(
         self,
         frame_bgr: np.ndarray,
-        depth_frame: np.ndarray,
-        sign_template_gray: Optional[np.ndarray] = None
-    ) -> List[ParkingSpotResult]:
+        depth_frame: np.ndarray
+    ) -> Tuple[Point, Optional[float]]:
         """
-        Full pipeline for a single RGB + depth frame.
-        frame_bgr: HxWx3 BGR image
-        depth_frame: HxW uint16 depth image (mm), aligned with frame_bgr
+        Use find_inner_blue_lines() to get the two vertical lines closest to the
+        middle of the screen, then compute the midpoint between them at the
+        vertical center of the image, and read depth there.
+
+        If one or both lines are missing, fall back gracefully:
+          - If one line is missing, use the image center for that side.
+          - If both missing, use the image center.
         """
-        spots_corners = self.detect_parking_spots_bgr(frame_bgr)
-        results: List[ParkingSpotResult] = []
+        h, w = frame_bgr.shape[:2]
+        mid_x = w // 2
+        mid_y = h // 2
 
-        for corners in spots_corners:
-            has_sign, has_obstacle = self.analyze_spot(frame_bgr, corners, sign_template_gray)
+        left_x, right_x = self.find_inner_blue_lines(frame_bgr)
 
-            xs = [p[0] for p in corners]
-            ys = [p[1] for p in corners]
-            cx = int(sum(xs) / len(xs))
-            cy = int(sum(ys) / len(ys))
-            center = (cx, cy)
-
-            depth_m = self.get_depth_at_pixel(depth_frame, cx, cy, use_median_3x3=True)
-
-            result = ParkingSpotResult(
-                corners=corners,
-                center=center,
-                has_no_parking_sign=has_sign,
-                has_obstacle=has_obstacle,
-                depth_m=depth_m,
+        # Fallbacks if lines not found
+        if left_x is None and right_x is None:
+            self.get_logger().warn(
+                "Could not find inner blue lines; using image center for depth."
             )
-            results.append(result)
+            cx = mid_x
+        elif left_x is None:
+            self.get_logger().warn(
+                f"Missing left inner blue line; using mid_x for left. right_x={right_x}"
+            )
+            cx = (mid_x + right_x) // 2
+        elif right_x is None:
+            self.get_logger().warn(
+                f"Missing right inner blue line; using mid_x for right. left_x={left_x}"
+            )
+            cx = (left_x + mid_x) // 2
+        else:
+            cx = (left_x + right_x) // 2
+            self.get_logger().info(
+                f"Inner blue lines: left_x={left_x}, right_x={right_x}, mid_x={cx}"
+            )
 
-        return results
+        cy = mid_y
+        depth_m = self.get_depth_at_pixel(depth_frame, cx, cy, use_median_3x3=True)
+        return (cx, cy), depth_m
 
     # -------------------------------------------------------------------------
-    # Best-spot selection logic
+    # Red / "NO PARKING" detection
     # -------------------------------------------------------------------------
-    def _classify_spot(self, spot: ParkingSpotResult) -> str:
-        """
-        Classify a spot as 'no_parking', 'obstacle', or 'empty'.
+    def _red_mask(self, frame_bgr: np.ndarray) -> np.ndarray:
+        """Return cleaned-up binary mask of red regions (two HSV lobes)."""
+        hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
 
-        NOTE: no_parking overrides obstacle if both are detected.
-        """
-        if spot.has_no_parking_sign:
-            return "no_parking"
-        if spot.has_obstacle:
-            return "obstacle"
-        return "empty"
+        RED1_LOWER = np.array([0,   100, 80])
+        RED1_UPPER = np.array([10,  255, 255])
+        RED2_LOWER = np.array([170, 100, 80])
+        RED2_UPPER = np.array([180, 255, 255])
 
-    def choose_best_spot(
-        self, results: List[ParkingSpotResult]
-    ) -> Optional[Tuple[ParkingSpotResult, str]]:
-        """
-        Apply the rules:
+        red_mask1 = cv2.inRange(hsv, RED1_LOWER, RED1_UPPER)
+        red_mask2 = cv2.inRange(hsv, RED2_LOWER, RED2_UPPER)
+        red_mask = cv2.bitwise_or(red_mask1, red_mask2)
 
-        - If there is a no parking sign in one, the best spot should always be the
-          other, empty spot.
-        - If there is an obstacle in one and a no parking sign in the other,
-          choose the one with an obstacle.
-        - If both spots are empty, choose the right-most spot.
-        - Tie-breakers and extra cases:
-          * If one empty and one obstacle → choose empty.
-          * If both obstacle → choose right-most.
-          * If both no_parking → no valid spot.
-        Returns (best_spot, side_str) where side_str is 'left' or 'right'.
+        kernel = np.ones((5, 5), np.uint8)
+        red_mask = cv2.morphologyEx(red_mask, cv2.MORPH_CLOSE, kernel)
+        red_mask = cv2.morphologyEx(red_mask, cv2.MORPH_OPEN, kernel)
+
+        return red_mask
+
+    def detect_no_parking_side_by_circle(
+        self,
+        frame_bgr: np.ndarray
+    ) -> Optional[str]:
         """
-        if not results:
+        Detect a red, mostly circular region (approximating a NO PARKING sign)
+        in the entire frame.
+
+        Returns:
+            'left' or 'right' based on which half of the image the sign center is in,
+            or None if no suitable circular region is found.
+        """
+        red_mask = self._red_mask(frame_bgr)
+        contours, _ = cv2.findContours(red_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        if not contours:
             return None
 
-        # Spots are sorted left-to-right already
-        if len(results) == 1:
-            spot = results[0]
-            status = self._classify_spot(spot)
-            if status == "no_parking":
-                return None
-            # Only one spot visible; treat it as 'left' logically
-            return spot, "left"
+        h, w = red_mask.shape[:2]
+        img_area = h * w
+        min_area = img_area * 0.005   # ignore tiny red blobs
+        max_area = img_area * 0.5     # ignore huge blobs
 
-        # We only care about the first two (left, right)
-        left_spot = results[0]
-        right_spot = results[1]
+        best_cnt = None
+        best_area = 0.0
 
-        left_status = self._classify_spot(left_spot)
-        right_status = self._classify_spot(right_spot)
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            if area < min_area or area > max_area:
+                continue
+
+            # Approximate circularity via min enclosing circle
+            (x_c, y_c), radius = cv2.minEnclosingCircle(cnt)
+            if radius <= 0:
+                continue
+
+            circle_area = float(np.pi * radius * radius)
+            if circle_area <= 0:
+                continue
+
+            circularity = area / circle_area  # 1.0 = perfect filled circle
+            if circularity < 0.5:
+                # Not circular enough to be our "circle with a line"
+                continue
+
+            if area > best_area:
+                best_area = area
+                best_cnt = cnt
+
+        if best_cnt is None:
+            return None
+
+        M = cv2.moments(best_cnt)
+        if M["m00"] == 0:
+            return None
+
+        cx = int(M["m10"] / M["m00"])
+        mid_x = w // 2
+        sign_side = "left" if cx < mid_x else "right"
 
         self.get_logger().info(
-            f"Spot statuses: left={left_status}, right={right_status}"
+            f"Circle-like red region detected at x={cx}, classified as side={sign_side}"
         )
+        return sign_side
 
-        # 1) exactly one empty and one no_parking → choose empty
-        if {"empty", "no_parking"} == {left_status, right_status}:
-            if left_status == "empty":
-                return left_spot, "left"
-            else:
-                return right_spot, "right"
+    def detect_no_parking_side_by_red_imbalance(
+        self,
+        frame_bgr: np.ndarray
+    ) -> Optional[str]:
+        """
+        Fallback: if no clear circle-like sign is detected, look at the total
+        red pixels on the left vs right halves of the image.
 
-        # 2) one obstacle and one no_parking → choose obstacle
-        if {"obstacle", "no_parking"} == {left_status, right_status}:
-            if left_status == "obstacle":
-                return left_spot, "left"
-            else:
-                return right_spot, "right"
+        If one side has a significantly larger share of red pixels, that side
+        is treated as the NO PARKING side.
+        """
+        red_mask = self._red_mask(frame_bgr)
+        h, w = red_mask.shape[:2]
+        mid_x = w // 2
 
-        # 3) both empty → choose right-most
-        if left_status == "empty" and right_status == "empty":
-            return right_spot, "right"
+        left_mask = red_mask[:, :mid_x]
+        right_mask = red_mask[:, mid_x:]
 
-        # 4) one empty, one obstacle → choose empty
-        if {"empty", "obstacle"} == {left_status, right_status}:
-            if left_status == "empty":
-                return left_spot, "left"
-            else:
-                return right_spot, "right"
+        red_left = int(cv2.countNonZero(left_mask))
+        red_right = int(cv2.countNonZero(right_mask))
+        total_red = red_left + red_right
 
-        # 5) both obstacle → choose right-most
-        if left_status == "obstacle" and right_status == "obstacle":
-            return right_spot, "right"
-
-        # 6) both no_parking → no valid spot
-        if left_status == "no_parking" and right_status == "no_parking":
+        if total_red == 0:
             return None
 
-        # Fallback (shouldn't really hit this, but just in case):
-        # prefer any non-no_parking, else None
-        for spot, side, status in [
-            (left_spot, "left", left_status),
-            (right_spot, "right", right_status),
-        ]:
-            if status != "no_parking":
-                return spot, side
+        diff = abs(red_left - red_right)
+        diff_ratio = diff / float(total_red)
 
-        return None
+        # "Major difference" threshold; tweak as needed.
+        if diff_ratio < 0.2:
+            # Not confidently biased to one side
+            return None
+
+        if red_left > red_right:
+            side = "left"
+        else:
+            side = "right"
+
+        self.get_logger().info(
+            f"Red imbalance detected: left={red_left}, right={red_right}, "
+            f"diff_ratio={diff_ratio:.2f}, side={side}"
+        )
+        return side
 
     # -------------------------------------------------------------------------
     # Service handler
     # -------------------------------------------------------------------------
     def handle_get_parking_spots(self, request, response):
         """
-        Service callback for /get_parking_spots using example_interfaces/Trigger.
+        Service callback for /get_parking_spots (example_interfaces/Trigger).
 
-        Grabs ONE frame, runs detection once, and encodes ONLY:
-          - which side ('left' or 'right') the best spot is on
-          - the distance (depth_m) to that spot
+        Steps:
 
-        Response format on success:
-          "side=left depth_m=1.23"
+          1. Grab one RGB + depth frame.
+          2. Compute depth at the midpoint between the two vertical blue lines
+             closest to the center of the image (inner tape lines).
+          3. Detect full blue parking spots (rectangles) and log an error if
+             fewer than two.
+          4. Independently of spot detection, try to detect a NO PARKING region:
+               - First by circle-like red region.
+               - Then by red pixel imbalance.
+             The resulting NO PARKING side (if any) is then inverted to select
+             the driving side to return.
+          5. If no sign is detected at all, log ROS error and default side="right".
+
+        Response on success:
+          response.success = True
+          response.message = "side=<left|right> depth_m=<float>"
         """
         self.get_logger().info("GetParkingSpots (Trigger) called, grabbing one frame...")
 
         frame_bgr, depth_frame = self.get_single_frame()
-        results = self.process_frame(frame_bgr, depth_frame, self.sign_template_gray)
 
-        if not results:
+        # 1) Always compute depth from inner blue lines (with fallback)
+        depth_point, depth_m = self.get_midpoint_depth(frame_bgr, depth_frame)
+        if depth_m is None:
+            self.get_logger().error(
+                f"Failed to obtain valid depth at depth_point={depth_point}"
+            )
             response.success = False
-            response.message = "No spots detected"
-            self.get_logger().info("Detection complete: no spots.")
+            response.message = "Could not obtain valid depth measurement"
             return response
 
-        best = self.choose_best_spot(results)
+        # 2) Detect parking spots (rectangles) just to know how many we see
+        spots = self.detect_parking_spots_bgr(frame_bgr)
+        num_spots = len(spots)
+        self.get_logger().info(f"Detected {num_spots} blue parking spot(s).")
 
-        if best is None:
-            response.success = False
-            response.message = "No valid parking spot found"
-            self.get_logger().info("Detection complete: no valid spot.")
-            return response
+        if num_spots < 2:
+            # Requirement: fewer than two spots -> ROS error
+            self.get_logger().error(
+                "Fewer than two parking spots detected; spots may be clipped. "
+                "Continuing with NO PARKING sign detection anyway."
+            )
 
-        best_spot, side = best
-        depth_val = best_spot.depth_m if best_spot.depth_m is not None else -1.0
+        # 3) Always try to detect NO PARKING side via circle
+        no_parking_side: Optional[str] = self.detect_no_parking_side_by_circle(frame_bgr)
+
+        # 4) If no circle sign, try red imbalance
+        if no_parking_side is None:
+            no_parking_side = self.detect_no_parking_side_by_red_imbalance(frame_bgr)
+
+        # 5) Decide output side (opposite of NO PARKING region if found)
+        if no_parking_side is None:
+            # Requirement: log ROS error if no sign is detected
+            self.get_logger().info(
+                "No NO PARKING sign detected (neither circle-like nor red imbalance). "
+                "Defaulting side=right."
+            )
+            selected_side = "right"
+        else:
+            selected_side = "left" if no_parking_side == "right" else "right"
+            self.get_logger().info(
+                f"NO PARKING region on {no_parking_side}; returning opposite side={selected_side}"
+            )
 
         response.success = True
-        response.message = f"side={side} depth_m={depth_val:.2f}"
-
+        response.message = f"side={selected_side} depth_m={depth_m:.2f}"
         self.get_logger().info(
-            f"Detection complete: {len(results)} spots, best side={side}, depth_m={depth_val:.2f}"
+            f"Service response: side={selected_side}, depth_m={depth_m:.2f}, "
+            f"depth_point={depth_point}"
         )
         return response
 
