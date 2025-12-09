@@ -542,6 +542,23 @@ class ParkingVisionNode(Node):
         )
         return response
 
+    # # Obstacle Detection for Sweeper Mechanism
+
+    # # 1. Depth check
+    # depth_point, depth_m = self.get_midpoint_depth(frame_bgr, depth_frame)
+    
+    # # Obstacle Detection Logic
+    # # If the measured depth is significantly shorter than the expected parking spot depth 
+    # # (e.g., < 0.5m), assume an object is there.
+    # has_obstacle = False
+    # if depth_m is not None and depth_m < 0.5: # Tune this threshold!
+    #     has_obstacle = True
+    #     self.get_logger().info(f"Obstacle detected at {depth_m:.2f}m!")
+
+    # # We append "obstacle=True" or "obstacle=False" to the string
+    # response.message = f"side={selected_side} depth_m={depth_m:.2f} obstacle={has_obstacle}"
+    
+    # return response
 
 def main(args=None):
     rclpy.init(args=args)
