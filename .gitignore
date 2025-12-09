@@ -1,0 +1,80 @@
+
+.venv/
+.venv
+orchestrator-old.py
+visionNode-old.py
+build/
+install/
+log/
+core
+/__pycache__
+
+# -------------------------
+# Python
+# -------------------------
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# -------------------------
+# ROS2 / Colcon Build Artifacts
+# -------------------------
+build/
+install/
+log/
+
+# Local ROS2 workspace metadata
+.colcon/
+CTestTestfile.cmake
+Testing/
+
+# -------------------------
+# IDE / Editor
+# -------------------------
+.vscode/
+.idea/
+
+# -------------------------
+# OS / Shell / Cache junk
+# -------------------------
+.DS_Store
+Thumbs.db
+
+# -------------------------
+# CMake build caches
+# -------------------------
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+*.cmake
+
+# -------------------------
+# Core dumps (these CORRUPT repos!)
+# -------------------------
+core
+core.*
+*.core
+
+# -------------------------
+# DepthAI / Camera
+# -------------------------
+*.bin
+
+# -------------------------
+# Misc
+# -------------------------
+*.bag
+*.launch.pyc
+*.tmp
+tmp/
+
