@@ -66,7 +66,7 @@ class ParkingHAL:
 
     def __init__(self, serial_port: str = "/dev/ttyACM0") -> None:
         self.vesc = VESC(serial_port=serial_port)
-        self.DUTY_CYCLE = 0.015
+        self.DUTY_CYCLE = 0.03
 
 
 
@@ -95,6 +95,7 @@ class ParkingHAL:
         Set steering, ensure wheels are straight to begin
         """
         self.vesc.set_servo(angle)
+        time.sleep(0.25)
 
 
     def drive(self, distance_m: float) -> None:
@@ -102,39 +103,86 @@ class ParkingHAL:
         Drive forward (distance_m > 0) or backward (distance_m < 0)
         by a given distance in meters, using tachometer feedback.
 
-
-        This is a blocking method
+        This is a blocking method.
         """
         if abs(distance_m) < 1e-4:
+            print("[HAL] drive(): tiny distance, returning nothing")
             return
 
+        if abs(distance_m) > 4:
+            print("[HAL] Distance request exceeded 4 meters, returning nothing")
+            return
+        
 
         poll_hz: float = 50.0
-
+        period = 1.0 / poll_hz
 
         # Direction: +1 for forward, -1 for backward
         direction = 1 if distance_m > 0 else -1
 
-
         # Find target tach counts
         target_counts = abs(distance_m) / self.DIST_PER_TACH
 
-
         start_tach = self._get_tach()
-        self._set_duty(direction * self.DUTY_CYCLE)
+        print(f"[HAL] drive(): distance={distance_m}, direction={direction}")
+        print(f"[HAL] drive(): start_tach={start_tach}, target_counts={target_counts}")
 
+        # Safety timeout (seconds)
+        max_time_s = 10.0
+        start_time = time.time()
+
+        # Turn on motor
+        self._set_duty(direction * self.DUTY_CYCLE)
+        print(f"[HAL] drive(): set duty = {direction * self.DUTY_CYCLE}")
 
         try:
-            period = 1.0 / poll_hz
             while True:
                 current_tach = self._get_tach()
                 delta_counts = (current_tach - start_tach) * direction
 
+                elapsed = time.time() - start_time
+                print(f"[HAL] drive(): tach={current_tach}, delta={delta_counts}, "
+                    f"elapsed={elapsed:.2f}s")
 
                 if delta_counts >= target_counts:
+                    print("[HAL] drive(): reached target counts, stopping")
                     break
 
+                if elapsed > max_time_s:
+                    print("[HAL] drive(): TIMEOUT, stopping to avoid infinite loop")
+                    break
 
                 time.sleep(period)
         finally:
             self.stop()
+            print("[HAL] drive(): stop() called")
+
+
+    def shutdown(self) -> None:
+        """
+        Cleanly shut down the VESC so Python can exit.
+        """
+        try:
+            print("[HAL] SHUTTING DOWN!")
+            # Make sure motor is off
+            self.stop()
+        except Exception:
+            pass
+
+        # Try to stop any heartbeat / background stuff if available
+        for attr_name in ("stop_heartbeat", "close", "disconnect"):
+            func = getattr(self.vesc, attr_name, None)
+            if callable(func):
+                try:
+                    func()
+                except Exception:
+                    pass
+
+        # Finally, close the underlying serial object (name depends on version)
+        for serial_attr in ("serial_port", "ser", "_ser"):
+            ser = getattr(self.vesc, serial_attr, None)
+            if ser is not None:
+                try:
+                    ser.close()
+                except Exception:
+                    pass

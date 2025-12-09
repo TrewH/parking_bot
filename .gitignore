@@ -1,0 +1,10 @@
+
+.venv/
+.venv
+orchestrator-old.py
+visionNode-old.py
+build/
+install/
+log/
+core
+/__pycache__
