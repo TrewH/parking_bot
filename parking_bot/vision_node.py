@@ -8,6 +8,7 @@ import numpy as np
 import rclpy
 from rclpy.node import Node
 from example_interfaces.srv import Trigger
+import apriltag  # NEW
 
 Point = Tuple[int, int]
 
@@ -19,25 +20,34 @@ class ParkingVisionNode(Node):
       - Connects to an OAK-D camera
       - Gets RGB and depth frames
       - Detects:
-          * Blue-tape parking spots on the ground (as blobs).
-          * A red "NO PARKING" region (circle-ish + fallback red imbalance).
+          * A red "NO PARKING" region (circle-ish + fallback red imbalance)
+          * (Optionally) blue-tape spots for logging.
+          * An AprilTag used as a distance marker.
 
-    Core behavior:
+    Depth behavior (NEW):
 
-      - Depth is measured at the front edge of the parking spots:
-          * We find blue blobs in the lower part of the image (the two spots).
-          * For each blob, we take its bottom-most y-pixel.
-          * We average those two y-values to get the front edge y.
-          * x is always the horizontal image center (car is centered).
-      - Independently of depth, we:
-          * Try to detect a NO PARKING sign by looking for a red circular-ish
-            region (circle + line style).
-          * If that fails, fall back to comparing red pixel counts on the
-            left vs right halves of the image.
-          * The service ALWAYS returns the OPPOSITE side of the detected
-            no-parking region, if it exists.
-      - We also detect how many blue parking spots are visible and log an
-        error if fewer than two are found.
+      - We ONLY trust depth at a vertical AprilTag (family tag36h11).
+      - On each service call, we:
+          * Grab up to N frames (default 10).
+          * For each frame, detect AprilTags.
+          * If a tag is found, take its center pixel (cx, cy),
+            look up depth there, and store it.
+          * At the end, we take the MEDIAN of all valid depth samples.
+
+      - If no valid tag depth is obtained from any sample:
+          * We set depth_m = 1000.0 (sentinel "no tag" distance).
+          * We set response.success = False.
+          * We append "no_tag=1" in the message string so the orchestrator
+            can detect this condition.
+
+    Side selection:
+
+      - Independently of depth, we still:
+          * Try to detect a NO PARKING sign via circle-like red region.
+          * If that fails, fall back to red pixel imbalance.
+          * The resulting NO PARKING side (if any) is inverted to select
+            the driving side to return.
+          * If no sign at all, default side="right".
     """
 
     def __init__(self) -> None:
@@ -47,13 +57,19 @@ class ParkingVisionNode(Node):
         self.pipeline = self._create_pipeline()
         self.device = dai.Device(self.pipeline)
 
-        # Output queues (same settings as in the minimal working depth script)
+        # Output queues
         self.q_rgb = self.device.getOutputQueue(name="rgb", maxSize=1, blocking=True)
         self.q_depth = self.device.getOutputQueue(name="depth", maxSize=1, blocking=True)
-
-        # These are currently unused but fine to keep around if you want them later
         self.q_mono_left = self.device.getOutputQueue(name="mono_left", maxSize=1, blocking=True)
         self.q_mono_right = self.device.getOutputQueue(name="mono_right", maxSize=1, blocking=True)
+
+        # AprilTag detector (family tag36h11)
+        options = apriltag.DetectorOptions(
+            families="tag36h11",
+            quad_decimate=1.0,
+            refine_edges=True,
+        )
+        self.apriltag_detector = apriltag.Detector(options)
 
         # Service: one-shot detection
         self.srv = self.create_service(
@@ -77,19 +93,19 @@ class ParkingVisionNode(Node):
         cam_rgb.setColorOrder(dai.ColorCameraProperties.ColorOrder.BGR)
         cam_rgb.setFps(30)
 
-        # Mono cameras for stereo (MATCH minimal working example)
+        # Mono cameras for stereo
         mono_left = pipeline.create(dai.node.MonoCamera)
         mono_right = pipeline.create(dai.node.MonoCamera)
-        mono_left.setBoardSocket(dai.CameraBoardSocket.LEFT)
-        mono_right.setBoardSocket(dai.CameraBoardSocket.RIGHT)
         mono_left.setResolution(dai.MonoCameraProperties.SensorResolution.THE_400_P)
         mono_right.setResolution(dai.MonoCameraProperties.SensorResolution.THE_400_P)
+        mono_left.setBoardSocket(dai.CameraBoardSocket.LEFT)
+        mono_right.setBoardSocket(dai.CameraBoardSocket.RIGHT)
 
-        # Stereo depth (MATCH minimal working example as much as possible)
+        # Stereo depth
         stereo = pipeline.create(dai.node.StereoDepth)
         stereo.setDefaultProfilePreset(dai.node.StereoDepth.PresetMode.HIGH_DENSITY)
-        stereo.setSubpixel(False)  # depth in integer millimeters
-        stereo.setDepthAlign(dai.CameraBoardSocket.RGB)  # align depth to RGB so coords match
+        stereo.setDepthAlign(dai.CameraBoardSocket.RGB)  # align depth to RGB
+        stereo.setSubpixel(False)
 
         mono_left.out.link(stereo.left)
         mono_right.out.link(stereo.right)
@@ -103,7 +119,6 @@ class ParkingVisionNode(Node):
         xout_depth.setStreamName("depth")
         stereo.depth.link(xout_depth.input)
 
-        # Optional mono debug outputs
         xout_mono_left = pipeline.create(dai.node.XLinkOut)
         xout_mono_left.setStreamName("mono_left")
         mono_left.out.link(xout_mono_left.input)
@@ -118,18 +133,12 @@ class ParkingVisionNode(Node):
         """
         Blocking wait for one RGB and one depth frame from the OAK-D.
         Returns (frame_bgr, depth_frame).
-
-        depth_frame: HxW uint16 array, depth in millimeters, aligned to RGB.
         """
         in_rgb = self.q_rgb.get()    # blocking until a frame arrives
         in_depth = self.q_depth.get()
-
-        frame_rgb = in_rgb.getCvFrame()              # RGB (from ColorCamera preview)
+        frame_rgb = in_rgb.getCvFrame()
         frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
-
-        depth_frame = in_depth.getFrame()            # HxW uint16 (mm)
-        h, w = depth_frame.shape
-        self.get_logger().debug(f"Depth frame received, shape = {w}x{h}, dtype={depth_frame.dtype}")
+        depth_frame = in_depth.getFrame()   # HxW uint16 (mm)
 
         return frame_bgr, depth_frame
 
@@ -148,11 +157,11 @@ class ParkingVisionNode(Node):
         Assumes depth_frame is uint16 in millimeters.
         If depth is invalid (0 or NaN region), returns None.
 
-        NOTE: OpenCV / DepthAI indexing convention:
-              depth_frame[row, col] = depth_frame[y, x]
-              - origin (0, 0) is top-left
-              - x increases to the RIGHT
-              - y increases DOWN
+        OpenCV / DepthAI convention:
+            depth_frame[row, col] = depth_frame[y, x]
+            origin (0, 0) is top-left
+            x increases to the RIGHT
+            y increases DOWN
         """
         h, w = depth_frame.shape[:2]
 
@@ -161,13 +170,12 @@ class ParkingVisionNode(Node):
             return None
 
         if not use_median_3x3:
-            # Direct read (like the minimal working script)
             raw_val = int(depth_frame[y, x])
             if raw_val <= 0:
                 return None
             return raw_val / 1000.0  # mm -> m
 
-        # 3x3 neighborhood around (x, y) — similar to printing a patch in the test script
+        # 3x3 neighborhood around (x, y)
         x0 = max(0, x - 1)
         x1 = min(w, x + 2)
         y0 = max(0, y - 1)
@@ -190,7 +198,82 @@ class ParkingVisionNode(Node):
         return median_mm / 1000.0  # mm -> m
 
     # -------------------------------------------------------------------------
-    # Color masks
+    # AprilTag-based depth sampling
+    # -------------------------------------------------------------------------
+    def sample_tag_depth(
+        self,
+        num_samples: int = 10
+    ) -> Tuple[Optional[np.ndarray], Optional[Point], Optional[float]]:
+        """
+        Take up to num_samples frames, detect AprilTag (tag36h11) in each,
+        and collect depth measurements at the tag center.
+
+        Returns:
+            (last_frame_bgr, tag_point, depth_median)
+
+            - last_frame_bgr: the last RGB frame captured (always non-None
+              if camera is working).
+            - tag_point: (x, y) of the tag center from the LAST valid depth sample,
+              or None if no tag/depth was valid.
+            - depth_median: median of all valid depth samples in meters,
+              or None if no valid samples.
+        """
+        depths: List[float] = []
+        tag_point: Optional[Point] = None
+        last_frame_bgr: Optional[np.ndarray] = None
+
+        for i in range(num_samples):
+            frame_bgr, depth_frame = self.get_single_frame()
+            last_frame_bgr = frame_bgr
+
+            gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+            detections = self.apriltag_detector.detect(gray)
+            self.get_logger().info(
+                f"[DEBUG] sample {i+1}/{num_samples}: detected {len(detections)} AprilTag(s)"
+            )
+
+            if not detections:
+                continue
+
+            det = detections[0]  # just use the first for now
+            cx, cy = det.center
+            x = int(round(cx))
+            y = int(round(cy))
+
+            depth_m = self.get_depth_at_pixel(depth_frame, x, y, use_median_3x3=True)
+            if depth_m is None:
+                self.get_logger().warn(
+                    f"[WARN] No valid depth at AprilTag center for sample {i+1}. "
+                    f"Pixel=({x},{y})"
+                )
+                continue
+
+            depths.append(depth_m)
+            tag_point = (x, y)
+            self.get_logger().info(
+                f"[INFO] Sample {i+1}: Tag ID={det.tag_id}, "
+                f"pixel=({x},{y}), depth_m={depth_m:.3f}"
+            )
+
+        if last_frame_bgr is None:
+            # Should not happen if the camera is running, but guard just in case.
+            self.get_logger().error("No frames received from OAK-D in sample_tag_depth().")
+            return None, None, None
+
+        if not depths:
+            self.get_logger().error(
+                f"No valid AprilTag depth samples after {num_samples} attempts."
+            )
+            return last_frame_bgr, None, None
+
+        median_depth_m = float(np.median(depths))
+        self.get_logger().info(
+            f"Median depth over {len(depths)} valid AprilTag samples: {median_depth_m:.3f} m"
+        )
+        return last_frame_bgr, tag_point, median_depth_m
+
+    # -------------------------------------------------------------------------
+    # Color masks (red and blue)
     # -------------------------------------------------------------------------
     def _red_mask(self, frame_bgr: np.ndarray) -> np.ndarray:
         """Return cleaned-up binary mask of red regions (two HSV lobes)."""
@@ -212,7 +295,7 @@ class ParkingVisionNode(Node):
         return red_mask
 
     def _blue_mask(self, frame_bgr: np.ndarray) -> np.ndarray:
-        """Return cleaned-up binary mask of blue tape."""
+        """Return cleaned-up binary mask of blue tape (still here for logging/debug)."""
         hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
 
         BLUE_LOWER = np.array([93, 45,  104], dtype=np.uint8)
@@ -227,59 +310,15 @@ class ParkingVisionNode(Node):
         return mask
 
     # -------------------------------------------------------------------------
-    # Blue spot geometry (for depth + spot count)
+    # Blue spot geometry (for spot count / logging only)
     # -------------------------------------------------------------------------
-    def _find_spot_bottoms_from_blobs(
-        self,
-        frame_bgr: np.ndarray,
-    ) -> List[Tuple[int, int]]:
-        """
-        Find blue parking-spot blobs in the entire image and return
-        a list of (cx, y_bottom) pairs:
-
-            - cx       = approximate horizontal center of the blob
-            - y_bottom = bottom-most y pixel of that blob (in full-image coords)
-
-        The list is sorted left-to-right by cx.
-
-        NOTE: Because OpenCV uses y-down, "bottom-most" = max(y).
-        """
-        blue_mask = self._blue_mask(frame_bgr)
-        h, w = blue_mask.shape[:2]
-
-        contours, _ = cv2.findContours(
-            blue_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-        )
-
-        img_area = h * w
-        min_area = img_area * 0.03
-
-        blobs: List[Tuple[int, int]] = []
-
-        for i, cnt in enumerate(contours):
-            area = cv2.contourArea(cnt)
-            if area < min_area:
-                continue
-
-            ys = cnt[:, 0, 1]  # y coords
-            xs = cnt[:, 0, 0]  # x coords
-
-            y_bottom = int(ys.max())
-            cx = int(xs.mean())
-
-            blobs.append((cx, y_bottom))
-
-        blobs.sort(key=lambda p: p[0])
-        self.get_logger().info(f"[DEBUG] blobs detected (cx, y_bottom): {blobs}")
-        return blobs
-
     def detect_parking_spots_bgr(self, frame_bgr: np.ndarray) -> List[List[Point]]:
         """
         Detect parking spots outlined in blue tape as blobs/rectangles.
 
         Returns a list of spots, each as a list of 4 (x, y) corner points.
-        Only used for logging how many spots are visible; depth comes from
-        _find_spot_bottoms_from_blobs().
+        Only used for logging how many spots are visible; depth is now
+        determined solely from the AprilTag, not the floor.
         """
         blue_mask = self._blue_mask(frame_bgr)
         contours, _ = cv2.findContours(
@@ -322,68 +361,6 @@ class ParkingVisionNode(Node):
 
         spots = sorted(spots, key=spot_center_x)
         return spots
-
-    def get_midpoint_depth(
-        self,
-        frame_bgr: np.ndarray,
-        depth_frame: np.ndarray
-    ) -> Tuple[Point, Optional[float]]:
-        """
-        Compute depth at the point where the parking spots START (front edge).
-
-        Assumptions:
-          - Car is centered horizontally between the two spots.
-          - We only care about the y at which the tape blobs begin.
-          - So x is always image_center_x; y is based on the bottoms of the blobs.
-
-        Steps:
-          1. Find blue blobs.
-          2. For each blob, compute bottom-most y (max y, since y increases down).
-          3. If we have two blobs, average their y_bottom values.
-             If we have one, just use its y_bottom (with a warning).
-             If none, fall back to image center.
-          4. Measure depth at (x_mid, y_front).
-        """
-        h, w = frame_bgr.shape[:2]
-        x_mid = w // 2
-
-        blobs = self._find_spot_bottoms_from_blobs(frame_bgr)
-
-        if len(blobs) >= 2:
-            (_, y_bottom_left), (_, y_bottom_right) = blobs[0], blobs[1]
-            y_front = int((y_bottom_left + y_bottom_right) / 2.0)
-            self.get_logger().info(
-                f"Front edge from blobs: y_bottom_left={y_bottom_left}, "
-                f"y_bottom_right={y_bottom_right}, y_front={y_front}"
-            )
-        elif len(blobs) == 1:
-            (_, y_front) = blobs[0]
-            self.get_logger().warn(
-                f"Only one parking-spot blob detected; using its bottom y={y_front}"
-            )
-        else:
-            # Total fallback if we see no blobs at all
-            y_front = h // 2
-            self.get_logger().warn(
-                "No parking-spot blobs detected; using image center for depth."
-            )
-
-        # Clamp just in case
-        y_front = max(0, min(h - 1, y_front))
-
-        # Log the pixel we’re about to query (mirrors the debug in the test script)
-        self.get_logger().info(
-            f"Sampling depth at image pixel (x_mid={x_mid}, y_front={y_front})"
-        )
-
-        depth_m = self.get_depth_at_pixel(
-            depth_frame,
-            x_mid,
-            y_front,
-            use_median_3x3=True,
-        )
-
-        return (x_mid, y_front), depth_m
 
     # -------------------------------------------------------------------------
     # Red / "NO PARKING" detection
@@ -508,54 +485,46 @@ class ParkingVisionNode(Node):
 
         Steps:
 
-          1. Grab one RGB + depth frame.
-          2. Compute depth at the front edge of the parking spots using
-             blob geometry (bottoms of blue blobs, averaged).
-          3. Detect blue parking spots and log how many we see (error if < 2).
-          4. Independently, try to detect a NO PARKING region:
-               - First by circle-like red region.
-               - Then by red pixel imbalance.
-             The resulting NO PARKING side (if any) is then inverted to select
-             the driving side to return.
-          5. If no sign is detected at all, default side="right".
+          1. Take up to N frames (N=10) and:
+               - Detect AprilTag in each.
+               - Get depth at tag center for each valid detection.
+               - Aggregate median depth.
+          2. Use the last RGB frame from that sampling to:
+               - Detect blue parking spots (for logging only).
+               - Detect a NO PARKING region (circle-like or red imbalance).
+          3. Decide output side (opposite of NO PARKING region if found).
+          4. If no valid tag depth:
+               - depth_m = 1000.0 (sentinel "no tag").
+               - success = False.
+               - message includes "no_tag=1".
+          5. If we do have a valid depth:
+               - success = True.
 
-        Response on success:
-          response.success = True
-          response.message = "side=<left|right> depth_m=<float>"
+        Response format:
+          response.success = True/False
+          response.message = "side=<left|right> depth_m=<float> [no_tag=1]"
         """
-        self.get_logger().info("GetParkingSpots (Trigger) called, grabbing one frame...")
+        self.get_logger().info("GetParkingSpots (Trigger) called, sampling AprilTag depth...")
 
-        frame_bgr, depth_frame = self.get_single_frame()
+        frame_bgr, tag_point, depth_m = self.sample_tag_depth(num_samples=10)
 
-        # 1) Compute depth at the front edge of the spots
-        depth_point, depth_m = self.get_midpoint_depth(frame_bgr, depth_frame)
-        if depth_m is None:
-            self.get_logger().error(
-                f"Failed to obtain valid depth at depth_point={depth_point}"
-            )
+        if frame_bgr is None:
+            # Catastrophic camera failure
+            self.get_logger().error("No RGB frame available; cannot proceed.")
             response.success = False
-            response.message = "Could not obtain valid depth measurement"
+            response.message = "Camera failure: no RGB frame."
             return response
 
-        # 2) Detect parking spots (rectangles/blobs) just to know how many we see
+        # Logging: # of blue spots (still optional, independent of depth)
         spots = self.detect_parking_spots_bgr(frame_bgr)
         num_spots = len(spots)
         self.get_logger().info(f"Detected {num_spots} blue parking spot(s).")
 
-        if num_spots < 2:
-            self.get_logger().error(
-                "Fewer than two parking spots detected; spots may be clipped. "
-                "Continuing with NO PARKING sign detection anyway."
-            )
-
-        # 3) Always try to detect NO PARKING side via circle
+        # Detect NO PARKING side via circle or red imbalance
         no_parking_side: Optional[str] = self.detect_no_parking_side_by_circle(frame_bgr)
-
-        # 4) If no circle sign, try red imbalance
         if no_parking_side is None:
             no_parking_side = self.detect_no_parking_side_by_red_imbalance(frame_bgr)
 
-        # 5) Decide output side (opposite of NO PARKING region if found)
         if no_parking_side is None:
             self.get_logger().info(
                 "No NO PARKING sign detected (neither circle-like nor red imbalance). "
@@ -568,11 +537,27 @@ class ParkingVisionNode(Node):
                 f"NO PARKING region on {no_parking_side}; returning opposite side={selected_side}"
             )
 
-        response.success = True
-        response.message = f"side={selected_side} depth_m={depth_m:.2f}"
+        # Handle depth / tag status
+        no_tag = False
+        if depth_m is None:
+            no_tag = True
+            depth_m = 1000.0  # sentinel distance
+            self.get_logger().error(
+                "No valid AprilTag depth from any sample; "
+                "sending sentinel depth_m=1000.0 and marking success=False."
+            )
+
+        # Build response
+        response.success = not no_tag
+        msg = f"side={selected_side} depth_m={depth_m:.2f}"
+        if no_tag:
+            msg += " no_tag=1"
+        response.message = msg
+
         self.get_logger().info(
-            f"Service response: side={selected_side}, depth_m={depth_m:.2f}, "
-            f"depth_point={depth_point}"
+            f"Service response: success={response.success}, "
+            f"side={selected_side}, depth_m={depth_m:.2f}, tag_point={tag_point}, "
+            f"message='{msg}'"
         )
         return response
 

@@ -109,11 +109,11 @@ class ParkingHAL:
             print("[HAL] drive(): tiny distance, returning nothing")
             return
 
-        if abs(distance_m) > 4:
+        if abs(distance_m) > 2.5:
             print("[HAL] Distance request exceeded 4 meters, returning nothing")
             return
         
-
+        printing_counter = 0
         poll_hz: float = 50.0
         period = 1.0 / poll_hz
 
@@ -141,7 +141,7 @@ class ParkingHAL:
                 delta_counts = (current_tach - start_tach) * direction
 
                 elapsed = time.time() - start_time
-                print(f"[HAL] drive(): tach={current_tach}, delta={delta_counts}, "
+                print(f"[HAL] drive(): {current_tach}/{target_counts}, "
                     f"elapsed={elapsed:.2f}s")
 
                 if delta_counts >= target_counts:
@@ -151,6 +151,12 @@ class ParkingHAL:
                 if elapsed > max_time_s:
                     print("[HAL] drive(): TIMEOUT, stopping to avoid infinite loop")
                     break
+
+                printing_counter = printing_counter + 1
+
+                if printing_counter % 10 == 0:
+                    print(f"[HAL] drive(): {current_tach}/{target_counts}, "
+                    f"elapsed={elapsed:.2f}s")
 
                 time.sleep(period)
         finally:
