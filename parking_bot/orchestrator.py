@@ -33,6 +33,24 @@ class Orchestrator(Node):
 
         self.get_logger().info('Service is available.')
 
+        # # For Sweeper Mechanism
+        # self.sweeper_cli = self.create_client(Trigger, 'activate_sweeper')
+    
+    # def trigger_sweeper(self):
+    # """Blocks until the sweep is finished."""
+    # if not self.sweeper_cli.wait_for_service(timeout_sec=1.0):
+    #     self.get_logger().error("Sweeper service not available!")
+    #     return
+
+    # req = Trigger.Request()
+    # future = self.sweeper_cli.call_async(req)
+    # rclpy.spin_until_future_complete(self, future)
+    # res = future.result()
+    # if res.success:
+    #     self.get_logger().info("Sweeper successfully cleared the path.")
+    # else:
+    #     self.get_logger().error(f"Sweeper failed: {res.message}")
+
     # ------------------------------------------------------------------
     # Service interaction
     # ------------------------------------------------------------------
@@ -169,6 +187,13 @@ class Orchestrator(Node):
             return None, None
 
         return distance_m, side
+
+        # # Obstacle field for sweeper
+        
+        # obstacle_str = kv.get('obstacle')
+        # has_obstacle = (obstacle_str == 'True') 
+
+        # return distance_m, side, has_obstacle
 
 
 def main(args=None) -> None:
