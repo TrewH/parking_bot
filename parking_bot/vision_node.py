@@ -47,9 +47,11 @@ class ParkingVisionNode(Node):
         self.pipeline = self._create_pipeline()
         self.device = dai.Device(self.pipeline)
 
-        # Output queues
+        # Output queues (same settings as in the minimal working depth script)
         self.q_rgb = self.device.getOutputQueue(name="rgb", maxSize=1, blocking=True)
         self.q_depth = self.device.getOutputQueue(name="depth", maxSize=1, blocking=True)
+
+        # These are currently unused but fine to keep around if you want them later
         self.q_mono_left = self.device.getOutputQueue(name="mono_left", maxSize=1, blocking=True)
         self.q_mono_right = self.device.getOutputQueue(name="mono_right", maxSize=1, blocking=True)
 
@@ -75,19 +77,19 @@ class ParkingVisionNode(Node):
         cam_rgb.setColorOrder(dai.ColorCameraProperties.ColorOrder.BGR)
         cam_rgb.setFps(30)
 
-        # Mono cameras for stereo
+        # Mono cameras for stereo (MATCH minimal working example)
         mono_left = pipeline.create(dai.node.MonoCamera)
         mono_right = pipeline.create(dai.node.MonoCamera)
-        mono_left.setResolution(dai.MonoCameraProperties.SensorResolution.THE_400_P)
-        mono_right.setResolution(dai.MonoCameraProperties.SensorResolution.THE_400_P)
         mono_left.setBoardSocket(dai.CameraBoardSocket.LEFT)
         mono_right.setBoardSocket(dai.CameraBoardSocket.RIGHT)
+        mono_left.setResolution(dai.MonoCameraProperties.SensorResolution.THE_400_P)
+        mono_right.setResolution(dai.MonoCameraProperties.SensorResolution.THE_400_P)
 
-        # Stereo depth
+        # Stereo depth (MATCH minimal working example as much as possible)
         stereo = pipeline.create(dai.node.StereoDepth)
         stereo.setDefaultProfilePreset(dai.node.StereoDepth.PresetMode.HIGH_DENSITY)
-        stereo.setDepthAlign(dai.CameraBoardSocket.RGB)  # align depth to RGB
-        stereo.setSubpixel(False)
+        stereo.setSubpixel(False)  # depth in integer millimeters
+        stereo.setDepthAlign(dai.CameraBoardSocket.RGB)  # align depth to RGB so coords match
 
         mono_left.out.link(stereo.left)
         mono_right.out.link(stereo.right)
@@ -101,6 +103,7 @@ class ParkingVisionNode(Node):
         xout_depth.setStreamName("depth")
         stereo.depth.link(xout_depth.input)
 
+        # Optional mono debug outputs
         xout_mono_left = pipeline.create(dai.node.XLinkOut)
         xout_mono_left.setStreamName("mono_left")
         mono_left.out.link(xout_mono_left.input)
@@ -115,12 +118,18 @@ class ParkingVisionNode(Node):
         """
         Blocking wait for one RGB and one depth frame from the OAK-D.
         Returns (frame_bgr, depth_frame).
+
+        depth_frame: HxW uint16 array, depth in millimeters, aligned to RGB.
         """
         in_rgb = self.q_rgb.get()    # blocking until a frame arrives
         in_depth = self.q_depth.get()
-        frame_rgb = in_rgb.getCvFrame()
+
+        frame_rgb = in_rgb.getCvFrame()              # RGB (from ColorCamera preview)
         frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
-        depth_frame = in_depth.getFrame()   # HxW uint16 (mm)
+
+        depth_frame = in_depth.getFrame()            # HxW uint16 (mm)
+        h, w = depth_frame.shape
+        self.get_logger().debug(f"Depth frame received, shape = {w}x{h}, dtype={depth_frame.dtype}")
 
         return frame_bgr, depth_frame
 
@@ -138,19 +147,27 @@ class ParkingVisionNode(Node):
         Returns depth in meters at (x, y).
         Assumes depth_frame is uint16 in millimeters.
         If depth is invalid (0 or NaN region), returns None.
+
+        NOTE: OpenCV / DepthAI indexing convention:
+              depth_frame[row, col] = depth_frame[y, x]
+              - origin (0, 0) is top-left
+              - x increases to the RIGHT
+              - y increases DOWN
         """
         h, w = depth_frame.shape[:2]
 
         if x < 0 or x >= w or y < 0 or y >= h:
+            self.get_logger().warn(f"Requested depth at out-of-bounds pixel ({x}, {y})")
             return None
 
         if not use_median_3x3:
+            # Direct read (like the minimal working script)
             raw_val = int(depth_frame[y, x])
             if raw_val <= 0:
                 return None
             return raw_val / 1000.0  # mm -> m
 
-        # 3x3 neighborhood around (x, y)
+        # 3x3 neighborhood around (x, y) — similar to printing a patch in the test script
         x0 = max(0, x - 1)
         x1 = min(w, x + 2)
         y0 = max(0, y - 1)
@@ -160,9 +177,16 @@ class ParkingVisionNode(Node):
         valid = patch[patch > 0]  # 0 usually means invalid depth
 
         if valid.size == 0:
+            self.get_logger().warn(
+                f"No valid depth values in 3x3 patch around ({x}, {y}). Patch:\n{patch}"
+            )
             return None
 
         median_mm = float(np.median(valid))
+        self.get_logger().debug(
+            f"Depth 3x3 patch around ({x},{y}) (mm):\n{patch}\n"
+            f"Using median depth {median_mm:.1f} mm"
+        )
         return median_mm / 1000.0  # mm -> m
 
     # -------------------------------------------------------------------------
@@ -205,7 +229,6 @@ class ParkingVisionNode(Node):
     # -------------------------------------------------------------------------
     # Blue spot geometry (for depth + spot count)
     # -------------------------------------------------------------------------
-    
     def _find_spot_bottoms_from_blobs(
         self,
         frame_bgr: np.ndarray,
@@ -218,6 +241,8 @@ class ParkingVisionNode(Node):
             - y_bottom = bottom-most y pixel of that blob (in full-image coords)
 
         The list is sorted left-to-right by cx.
+
+        NOTE: Because OpenCV uses y-down, "bottom-most" = max(y).
         """
         blue_mask = self._blue_mask(frame_bgr)
         h, w = blue_mask.shape[:2]
@@ -226,33 +251,27 @@ class ParkingVisionNode(Node):
             blue_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
         )
 
-        img_area = h*w
+        img_area = h * w
         min_area = img_area * 0.03
 
         blobs: List[Tuple[int, int]] = []
 
         for i, cnt in enumerate(contours):
             area = cv2.contourArea(cnt)
-
             if area < min_area:
                 continue
 
-            ys = cnt[:, 0, 1]  # full-image coords
-            xs = cnt[:, 0, 0]
+            ys = cnt[:, 0, 1]  # y coords
+            xs = cnt[:, 0, 0]  # x coords
 
             y_bottom = int(ys.max())
             cx = int(xs.mean())
 
             blobs.append((cx, y_bottom))
-            self.get_logger().info(
-                f"[DEBUG] contour {i} accepted -> cx={cx}, y_bottom={y_bottom}"
-            )
 
         blobs.sort(key=lambda p: p[0])
         self.get_logger().info(f"[DEBUG] blobs detected (cx, y_bottom): {blobs}")
         return blobs
-
-
 
     def detect_parking_spots_bgr(self, frame_bgr: np.ndarray) -> List[List[Point]]:
         """
@@ -318,8 +337,8 @@ class ParkingVisionNode(Node):
           - So x is always image_center_x; y is based on the bottoms of the blobs.
 
         Steps:
-          1. Find blue blobs in the lower part of the image.
-          2. For each blob, compute bottom-most y.
+          1. Find blue blobs.
+          2. For each blob, compute bottom-most y (max y, since y increases down).
           3. If we have two blobs, average their y_bottom values.
              If we have one, just use its y_bottom (with a warning).
              If none, fall back to image center.
@@ -351,6 +370,11 @@ class ParkingVisionNode(Node):
 
         # Clamp just in case
         y_front = max(0, min(h - 1, y_front))
+
+        # Log the pixel we’re about to query (mirrors the debug in the test script)
+        self.get_logger().info(
+            f"Sampling depth at image pixel (x_mid={x_mid}, y_front={y_front})"
+        )
 
         depth_m = self.get_depth_at_pixel(
             depth_frame,
