@@ -59,24 +59,31 @@ class SweeperServo:
         time.sleep(0.3)
 
     # ------------------------------------------------------------------
-    def full_sweep(self, speed=0.01):
+    def full_sweep(self, sweeprange, speed=0.02):
         """
-        Sweep from home_angle → (home_angle + 180°) and back,
-        automatically clamping to safe range.
+        Sweep from home_angle → (home_angle + sweeprange°) and back,
         """
-        print("[Servo] Starting home-based 180° sweep")
+        print("[Servo] Starting home-based ", sweeprange,"° sweep")
 
         start = int(self.home_angle)
-        end = self.home_angle + 180  # clamp max to 180°
+        end = self.home_angle - sweeprange
 
-        # Sweep forward
-        for a in range(start, end + 1, 2):
+        #servo only goes to 180
+        if end < 0:
+            end = 0
+
+        #Sweep forward
+        print("[Servo] Sweeping Forward")
+        for a in range(start,end-1, -2):
             self.servo.angle = a
             time.sleep(speed)
 
+
         # Sweep backward
-        for a in range(end, start - 1, -2):
+        print("[Servo] Sweeping Backward")
+        for a in range(end, start + 1, 2):
             self.servo.angle = a
+            #print(a) #debugging
             time.sleep(speed)
 
         # Return to home
@@ -86,8 +93,6 @@ class SweeperServo:
 
 if __name__ == "__main__":
     print(" Sweep Test Starting...")
-
-    # Initialize at right-most angle
-    while True:
-        arm = SweeperServo(channel=0, home_angle=7.5)
-        arm.full_sweep()
+    
+    arm = SweeperServo(channel=0, home_angle=180)
+    arm.full_sweep(sweeprange=120)
