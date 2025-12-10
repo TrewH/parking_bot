@@ -33,6 +33,24 @@ class Orchestrator(Node):
 
         self.get_logger().info('Service is available.')
 
+        # # For Sweeper Mechanism
+        # self.sweeper_cli = self.create_client(Trigger, 'activate_sweeper')
+    
+    # def trigger_sweeper(self):
+    # """Blocks until the sweep is finished."""
+    # if not self.sweeper_cli.wait_for_service(timeout_sec=1.0):
+    #     self.get_logger().error("Sweeper service not available!")
+    #     return
+
+    # req = Trigger.Request()
+    # future = self.sweeper_cli.call_async(req)
+    # rclpy.spin_until_future_complete(self, future)
+    # res = future.result()
+    # if res.success:
+    #     self.get_logger().info("Sweeper successfully cleared the path.")
+    # else:
+    #     self.get_logger().error(f"Sweeper failed: {res.message}")
+
     # ------------------------------------------------------------------
     # Service interaction
     # ------------------------------------------------------------------
@@ -170,6 +188,13 @@ class Orchestrator(Node):
 
         return distance_m, side
 
+        # # Obstacle field for sweeper
+        
+        # obstacle_str = kv.get('obstacle')
+        # has_obstacle = (obstacle_str == 'True') 
+
+        # return distance_m, side, has_obstacle
+
 
 def main(args=None) -> None:
     rclpy.init(args=args)
@@ -200,6 +225,27 @@ def main(args=None) -> None:
                 node.parallel_park_left(hal)
             else:
                 node.get_logger().error(f"Unexpected side '{side}', aborting.")
+                
+    # # For sweeper
+    # dist, side, has_obstacle = node.get_best_spot_position() # Update to unpack 3 values
+
+    #         if dist is not None:
+    #             # DRIVE TO POSITION FIRST
+    #             node.get_logger().info(f"Driving forward {dist:.2f} m...")
+    #             hal.set_steering(0.5)
+    #             hal.drive(dist)
+    #             time.sleep(PAUSE_BETWEEN_MOVES_S)
+
+    #     # CHECK OBSTACLE
+    #         if has_obstacle:
+    #             node.get_logger().warn("Obstacle reported! Deploying sweeper...")
+    #             node.trigger_sweeper()
+    #  # Optional: Move slightly to ensure clearance if needed
+    
+    # # NOW PARK
+    # if side == "right":
+    #      node.parallel_park_right(hal)
+    
     finally:
         # Clean shutdown of HAL and ROS
         try:
