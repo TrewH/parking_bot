@@ -1,7 +1,27 @@
 #!/usr/bin/env python3
 
-from typing import List, Tuple, Optional
+# =============================================================================
+# File: vision_node.py
+# Description: ROS2 Vision Node
+#
+# Authors:   Trew Hoffman
+# Created:     2025-11-26
+#
+# Notes:
+#   - This node connects to OAK-D camera to retrieve RGB and depth frames
+#   - Detects:
+#       - Parking spots (blue tape rectangles)
+#       - No parking sign (red, circular region)
+#       - AprilTag
+#   - Core behavior:
+#       - Depth is measured from AprilTag in multiple attempts with an expanding ROI
+#       - Both shape and average amount of red pixels is used to determine best side to park
+#       - Service returns the opposite side of detected no-parking sign indicating chosen side to park
+#       - If fewer than two parking spots are detected, parking still occursb but error is logged
+# =============================================================================
 
+
+from typing import List, Tuple, Optional
 import cv2
 import depthai as dai
 import numpy as np
@@ -13,32 +33,6 @@ Point = Tuple[int, int]
 
 
 class ParkingVisionNode(Node):
-    """
-    ROS2 node that:
-
-      - Connects to an OAK-D camera
-      - Gets RGB and depth frames
-      - Detects:
-          * Parking spots (blue tape rectangles)
-          * Vertical blue lines near the middle of the image
-          * Red "no parking" region (circle-ish + fallback red imbalance)
-
-    Core behavior:
-
-      - Depth is ALWAYS measured at the midpoint between the two vertical
-        blue lines closest to the middle of the screen (inner tape lines).
-      - Independently of parking spot detection, it will:
-          * Try to detect a NO PARKING sign by looking for a red circular-ish
-            region (circle + line style).
-          * If that fails, fall back to comparing red pixel counts on the
-            left vs right halves of the image.
-          * The service ALWAYS returns the OPPOSITE side of the detected
-            no-parking region, if it exists.
-      - If FEWER than two parking spots are detected, we still compute depth
-        and still run sign detection, but we log a ROS ERROR.
-      - If NO sign is detected (neither circle nor red imbalance), we log a
-        ROS ERROR and default the side.
-    """
 
     def __init__(self) -> None:
         super().__init__("parking_vision_node")
@@ -62,9 +56,6 @@ class ParkingVisionNode(Node):
 
         self.get_logger().info("ParkingVisionNode ready. Service: /get_parking_spots")
 
-    # -------------------------------------------------------------------------
-    # DepthAI pipeline setup
-    # -------------------------------------------------------------------------
     def _create_pipeline(self) -> dai.Pipeline:
         pipeline = dai.Pipeline()
 
@@ -86,13 +77,12 @@ class ParkingVisionNode(Node):
         # Stereo depth
         stereo = pipeline.create(dai.node.StereoDepth)
         stereo.setDefaultProfilePreset(dai.node.StereoDepth.PresetMode.HIGH_DENSITY)
-        stereo.setDepthAlign(dai.CameraBoardSocket.RGB)  # align depth to RGB
+        stereo.setDepthAlign(dai.CameraBoardSocket.RGB)
         stereo.setSubpixel(False)
 
         mono_left.out.link(stereo.left)
         mono_right.out.link(stereo.right)
 
-        # Outputs
         xout_rgb = pipeline.create(dai.node.XLinkOut)
         xout_rgb.setStreamName("rgb")
         cam_rgb.preview.link(xout_rgb.input)
@@ -116,17 +106,14 @@ class ParkingVisionNode(Node):
         Blocking wait for one RGB and one depth frame from the OAK-D.
         Returns (frame_bgr, depth_frame).
         """
-        in_rgb = self.q_rgb.get()    # blocking until a frame arrives
+        in_rgb = self.q_rgb.get()
         in_depth = self.q_depth.get()
 
-        frame_bgr = in_rgb.getCvFrame()     # HxWx3 BGR
-        depth_frame = in_depth.getFrame()   # HxW uint16 (mm)
+        frame_bgr = in_rgb.getCvFrame()
+        depth_frame = in_depth.getFrame()
 
         return frame_bgr, depth_frame
 
-    # -------------------------------------------------------------------------
-    # Basic utility
-    # -------------------------------------------------------------------------
     def get_depth_at_pixel(
         self,
         depth_frame: np.ndarray,
@@ -150,14 +137,13 @@ class ParkingVisionNode(Node):
                 return None
             return raw_val / 1000.0  # mm -> m
 
-        # 3x3 neighborhood around (x, y)
         x0 = max(0, x - 1)
         x1 = min(w, x + 2)
         y0 = max(0, y - 1)
         y1 = min(h, y + 2)
 
         patch = depth_frame[y0:y1, x0:x1].astype(np.int32)
-        valid = patch[patch > 0]  # 0 usually means invalid depth
+        valid = patch[patch > 0]
 
         if valid.size == 0:
             return None
@@ -165,9 +151,7 @@ class ParkingVisionNode(Node):
         median_mm = float(np.median(valid))
         return median_mm / 1000.0  # mm -> m
 
-    # -------------------------------------------------------------------------
-    # Blue detection: spots and vertical lines
-    # -------------------------------------------------------------------------
+
     def _blue_mask(self, frame_bgr: np.ndarray) -> np.ndarray:
         """Return cleaned-up binary mask of blue tape."""
         hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
@@ -194,8 +178,8 @@ class ParkingVisionNode(Node):
 
         spots: List[List[Point]] = []
         h, w = frame_bgr.shape[:2]
-        min_area = (w * h) * 0.01      # tweak: min area as fraction of image
-        max_area = (w * h) * 0.4       # tweak: max area
+        min_area = (w * h) * 0.01
+        max_area = (w * h) * 0.4
 
         for cnt in contours:
             area = cv2.contourArea(cnt)
@@ -206,7 +190,6 @@ class ParkingVisionNode(Node):
             peri = cv2.arcLength(cnt, True)
             approx = cv2.approxPolyDP(cnt, 0.02 * peri, True)
 
-            # We want rectangles (4 corners)
             if len(approx) != 4:
                 continue
 
@@ -221,7 +204,7 @@ class ParkingVisionNode(Node):
             corners = [(int(p[0][0]), int(p[0][1])) for p in approx]
             spots.append(corners)
 
-        # If more than 2 are found, keep the two largest by area
+        # If more than 2 are found: keep the two largest by area
         if len(spots) > 2:
             def spot_area(corners: List[Point]) -> float:
                 cnt = np.array(corners).reshape(-1, 1, 2)

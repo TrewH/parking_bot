@@ -2,29 +2,27 @@
 
 import time
 from typing import Optional, Tuple
-
 import rclpy
 from rclpy.node import Node
 from example_interfaces.srv import Trigger
+from .HAL import ParkingHAL
 
-from .HAL import ParkingHAL  # Your HAL wrapper
-
-PAUSE_BETWEEN_MOVES_S: float = 0.5  # to match your robot_control.py
+PAUSE_BETWEEN_MOVES_S: float = 0.5
 
 
 class Orchestrator(Node):
     """
-    High-level orchestrator node.
+    High-level process orchestrator node
 
-    - Does NOT instantiate the vision node.
-    - Communicates with the vision node only via the /get_parking_spots service.
-    - Uses the returned side + distance to run a fixed parallel parking maneuver.
+    - Communicates with the vision node via the /get_parking_spots service.
+    - Uses the returned side + distance to drive forward the proper amount 
+    and run a fixed parallel parking maneuver.
     """
 
     def __init__(self) -> None:
         super().__init__('orchestrator')
 
-        # Service client for the vision node
+        # Service client
         self.cli = self.create_client(Trigger, 'get_parking_spots')
         self.get_logger().info('Waiting for /get_parking_spots service...')
 
@@ -33,9 +31,6 @@ class Orchestrator(Node):
 
         self.get_logger().info('Service is available.')
 
-    # ------------------------------------------------------------------
-    # Service interaction
-    # ------------------------------------------------------------------
     def get_best_spot_position(self) -> Tuple[Optional[float], Optional[str]]:
         """
         Call /get_parking_spots and return (distance_m, side).
@@ -71,9 +66,6 @@ class Orchestrator(Node):
         self.get_logger().info(f"Best spot: side={side}, distance_m={distance_m:.2f}")
         return distance_m, side
 
-    # ------------------------------------------------------------------
-    # Parking maneuvers
-    # ------------------------------------------------------------------
     def parallel_park_right(self, hal: ParkingHAL) -> None:
         """
         Fixed parallel parking maneuver into a RIGHT-hand spot.
@@ -132,9 +124,6 @@ class Orchestrator(Node):
         hal.stop()
         self.get_logger().info("=== LEFT parallel park complete ===")
 
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
     def _parse_message(self, msg: str) -> Tuple[Optional[float], Optional[str]]:
         """
         Parse a message of the form:
@@ -179,13 +168,13 @@ def main(args=None) -> None:
     node.get_logger().info("HAL and Orchestrator running")
 
     try:
-        # One-shot service call + maneuver
+        # Service call
         dist, side = node.get_best_spot_position()
 
         if dist is None or side is None:
             node.get_logger().error("No valid best spot returned; aborting.")
         else:
-            # 1) Drive straight up to the spot
+            # Drive straight to spot
             node.get_logger().info(f"Driving forward {dist:.2f} m toward the spot...")
             hal.set_steering(0.5)
             hal.drive(dist)

@@ -4,9 +4,7 @@ import cv2
 import numpy as np
 import depthai as dai
 
-# ---------------------------
-# Helper: build pipeline
-# ---------------------------
+
 def create_pipeline() -> dai.Pipeline:
     pipeline = dai.Pipeline()
 
@@ -76,7 +74,7 @@ def main() -> None:
 
 
             cv2.imshow(rgb_win, frame)
-            cv2.imshow(mask_win, mask)      # white = detected
+            cv2.imshow(mask_win, mask)
 
             key = cv2.waitKey(1) & 0xFF
             if key in (ord('q'), 27):

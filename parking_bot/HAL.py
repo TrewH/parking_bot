@@ -29,14 +29,9 @@ The rest of the robot's code should treat this HAL as the only interface to the 
 
 Typical use:
     hal = ParkingHAL()
-    hal.drive_forward(1.0)      # ~1 meter
-    hal.drive_backward(0.3)
-    hal.turn(0.5)               # slight right
-
-
-Configuration:
-    Edit HALConfig() to match your car's servo values, duty cycle, and
-    measured straight-line speed.
+    hal.drive(1.0)
+    hal.set_steering(0.8)
+    hal.drive(-4.0)
 """
 
 
@@ -67,8 +62,6 @@ class ParkingHAL:
     def __init__(self, serial_port: str = "/dev/ttyACM0") -> None:
         self.vesc = VESC(serial_port=serial_port)
         self.DUTY_CYCLE = 0.03
-
-
 
 
     def _get_tach(self) -> int:
@@ -178,7 +171,7 @@ class ParkingHAL:
                 except Exception:
                     pass
 
-        # Finally, close the underlying serial object (name depends on version)
+        # Close the underlying serial object
         for serial_attr in ("serial_port", "ser", "_ser"):
             ser = getattr(self.vesc, serial_attr, None)
             if ser is not None:
