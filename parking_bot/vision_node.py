@@ -1,7 +1,33 @@
 #!/usr/bin/env python3
 
-from typing import List, Tuple, Optional
+# =============================================================================
+# File: parking_vision_node.py
+# Description: Vision node for detecting NO PARKING signs and estimating
+#              AprilTag distance using OAK-D stereo depth.
+#
+# Author:      Trew Hoffman
+# Created:     2025-12-12
+#
+# Inputs:
+#   - OAK-D mono left/right camera streams (400p)
+#   - OAK-D stereo depth (mm)
+#   - OAK-D RGB preview
+#   - ROS2 Trigger service call (/get_parking_spots)
+#
+# Outputs:
+#   - Service response string: "side=<left|right> depth_m=<meters>"
+#
+# Notes:
+#   - Computes distance via median depth inside AprilTag polygon.
+#   - Detects red no parking signs (circle + fallback color imbalance).
+#   - Returns the opposite side from detected sign.
+#   - Applies linear error correction to tag depth.
+#
+# Typical use:
+#     ros2 service call /get_parking_spots example_interfaces/srv/Trigger
+# =============================================================================
 
+from typing import List, Tuple, Optional
 import apriltag
 import cv2
 import depthai as dai
@@ -12,67 +38,38 @@ from example_interfaces.srv import Trigger
 
 Point = Tuple[int, int]
 
-MAX_VALID_DEPTH_MM = 8000  # treat >= 8 m as invalid for our use-case
+MAX_VALID_DEPTH_MM = 8000
 
 
 class ParkingVisionNode(Node):
-    """
-    ROS2 node that:
-
-      - Builds a DepthAI pipeline using:
-          * Mono left & right @ 400p
-          * StereoDepth in HIGH_ACCURACY mode with subpixel, LR check,
-            3x3 median filter, depth+rectified outputs.
-          * Color camera for RGB frames (for red/blue detection).
-
-      - Detects:
-          * A red "NO PARKING" region (circle-ish + fallback red imbalance)
-          * (Optionally) blue-tape spots for logging.
-          * An AprilTag (tag36h11) and measures its distance using the
-            median depth over the tag polygon.
-
-      - On each service call:
-          * Samples up to N frames from rectified-left + depth.
-          * For each detection, computes depth from the tag area.
-          * Returns the median of valid per-frame medians.
-    """
-
     def __init__(self) -> None:
         super().__init__("parking_vision_node")
 
-        # Build pipeline and connect to device
         self.pipeline = self._create_pipeline()
         self.device = dai.Device(self.pipeline)
 
-        # Output queues
-        # Depth in mm (rectified-left coordinate system)
         self.q_depth = self.device.getOutputQueue(
             name="depth", maxSize=1, blocking=True
         )
-        # Rectified left mono for AprilTag detection
         self.q_rect_left = self.device.getOutputQueue(
             name="rectifiedLeft", maxSize=1, blocking=True
         )
-        # RGB for red/blue detection and spot finding
         self.q_rgb = self.device.getOutputQueue(
             name="rgb", maxSize=1, blocking=True
         )
-        # Disparity (optional; for debugging only)
         self.q_disparity = self.device.getOutputQueue(
             name="disparity", maxSize=1, blocking=False
         )
 
-        # AprilTag detector (family tag36h11), tuned like test file
         options = apriltag.DetectorOptions(
             families="tag36h11",
-            quad_decimate=1.0,     # keep full 400p resolution
+            quad_decimate=1.0,
             refine_edges=True,
             refine_decode=True,
             refine_pose=True,
         )
         self.apriltag_detector = apriltag.Detector(options)
 
-        # Service: one-shot detection
         self.srv = self.create_service(
             Trigger,
             "get_parking_spots",
@@ -81,21 +78,9 @@ class ParkingVisionNode(Node):
 
         self.get_logger().info("ParkingVisionNode ready. Service: /get_parking_spots")
 
-    # -------------------------------------------------------------------------
-    # DepthAI pipeline setup (matching test file stereo config)
-    # -------------------------------------------------------------------------
     def _create_pipeline(self) -> dai.Pipeline:
-        """
-        Build a pipeline that uses:
-
-          - Mono left & right @ 400p
-          - StereoDepth with HIGH_ACCURACY preset, subpixel, LR check,
-            3x3 median filter, depth + rectified + disparity outputs.
-          - Color camera for RGB preview.
-        """
         pipeline = dai.Pipeline()
 
-        # --- Mono cameras (same as getMonoCamera) ---
         mono_left = pipeline.createMonoCamera()
         mono_left.setResolution(dai.MonoCameraProperties.SensorResolution.THE_400_P)
         mono_left.setFps(30)
@@ -106,32 +91,26 @@ class ParkingVisionNode(Node):
         mono_right.setFps(30)
         mono_right.setBoardSocket(dai.CameraBoardSocket.RIGHT)
 
-        # --- Stereo depth (same as getStereoPair) ---
         stereo = pipeline.createStereoDepth()
-
-        # Link mono cameras to stereo node
         mono_left.out.link(stereo.left)
         mono_right.out.link(stereo.right)
 
-        # Configure for accuracy
         stereo.setDefaultProfilePreset(dai.node.StereoDepth.PresetMode.HIGH_ACCURACY)
         stereo.setSubpixel(True)
         stereo.setLeftRightCheck(True)
         stereo.setExtendedDisparity(False)
         stereo.setMedianFilter(dai.MedianFilter.KERNEL_3x3)
 
-        stereo.setOutputDepth(True)          # depth in mm (rectified-left space)
-        stereo.setOutputRectified(True)      # rectified mono images
-        stereo.setConfidenceThreshold(200)   # filter low-confidence matches
+        stereo.setOutputDepth(True)
+        stereo.setOutputRectified(True)
+        stereo.setConfidenceThreshold(200)
 
-        # --- Color camera for RGB (for red / blue detection) ---
         cam_rgb = pipeline.createColorCamera()
-        cam_rgb.setPreviewSize(640, 400)  # 400p-ish to roughly match mono height
+        cam_rgb.setPreviewSize(640, 400)
         cam_rgb.setInterleaved(False)
         cam_rgb.setColorOrder(dai.ColorCameraProperties.ColorOrder.BGR)
         cam_rgb.setFps(30)
 
-        # XLink outputs
         xout_depth = pipeline.createXLinkOut()
         xout_depth.setStreamName("depth")
         stereo.depth.link(xout_depth.input)
@@ -150,16 +129,10 @@ class ParkingVisionNode(Node):
 
         return pipeline
 
-    # -------------------------------------------------------------------------
-    # Frame helpers
-    # -------------------------------------------------------------------------
     def _get_rect_left_and_depth(
         self,
     ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
-        """
-        Blocking read of a rectified-left frame + depth frame.
-        Returns (rect_left, depth_frame), or (None, None) on failure.
-        """
+        """Get one rectified-left frame and matching depth frame."""
         try:
             in_rect = self.q_rect_left.get()
             in_depth = self.q_depth.get()
@@ -167,40 +140,29 @@ class ParkingVisionNode(Node):
             self.get_logger().error(f"Error getting rectified/depth frames: {e}")
             return None, None
 
-        rect_left = in_rect.getCvFrame()   # 400p mono, uint8
-        depth_frame = in_depth.getFrame()  # HxW uint16, mm
+        rect_left = in_rect.getCvFrame()
+        depth_frame = in_depth.getFrame()
 
         return rect_left, depth_frame
 
     def _get_rgb_frame(self) -> Optional[np.ndarray]:
-        """
-        Blocking read of a single RGB frame (BGR order).
-        """
+        """Get one RGB frame (BGR)."""
         try:
             in_rgb = self.q_rgb.get()
         except RuntimeError as e:
             self.get_logger().error(f"Error getting RGB frame: {e}")
             return None
-        frame_bgr = in_rgb.getCvFrame()  # already BGR
-        return frame_bgr
+        return in_rgb.getCvFrame()
 
-    # -------------------------------------------------------------------------
-    # AprilTag depth logic (matching test file)
-    # -------------------------------------------------------------------------
     def _get_tag_depth_from_area(
         self,
         depth_frame: np.ndarray,
         det: apriltag.Detection,
     ) -> Optional[float]:
-        """
-        Compute depth as the median of all valid depth pixels inside the
-        AprilTag polygon (more stable than a single pixel).
-        """
+        """Median depth inside AprilTag polygon, in meters."""
         h, w = depth_frame.shape[:2]
 
-        corners = det.corners.astype(np.int32)  # (4, 2)
-
-        # Clamp to image bounds
+        corners = det.corners.astype(np.int32)
         corners[:, 0] = np.clip(corners[:, 0], 0, w - 1)
         corners[:, 1] = np.clip(corners[:, 1], 0, h - 1)
 
@@ -213,31 +175,18 @@ class ParkingVisionNode(Node):
 
         if valid.size == 0:
             self.get_logger().warn(
-                "[WARN] No valid depth values inside AprilTag area."
+                "No valid depth values inside AprilTag area."
             )
             return None
 
         median_mm = float(np.median(valid))
-        return median_mm / 1000.0  # mm -> m
+        return median_mm / 1000.0
 
     def sample_tag_depth(
         self,
         num_samples: int = 10,
     ) -> Tuple[Optional[np.ndarray], Optional[Point], Optional[float]]:
-        """
-        Take up to num_samples frames, detect AprilTag (tag36h11) in each,
-        and collect depth measurements over the *area* of the tag, using the
-        same technique as the test script (rectified-left + HIGH_ACCURACY stereo).
-
-        Returns:
-            (frame_bgr, tag_point, depth_median)
-
-            - frame_bgr: RGB BGR frame for color-based detection.
-            - tag_point: (x, y) of the tag center (rectified-left coords)
-              from the LAST valid depth sample, or None if no tag/depth valid.
-            - depth_median: median of all valid per-sample medians in meters,
-              or None if no valid samples.
-        """
+        """Take several samples, return RGB frame, tag center, and median depth (m)."""
         depths: List[float] = []
         tag_point: Optional[Point] = None
 
@@ -245,19 +194,17 @@ class ParkingVisionNode(Node):
             rect_left, depth_frame = self._get_rect_left_and_depth()
             if rect_left is None or depth_frame is None:
                 self.get_logger().warn(
-                    f"[WARN] sample {i+1}/{num_samples}: missing rectified/depth frame."
+                    f"sample {i+1}/{num_samples}: missing rectified/depth frame."
                 )
                 continue
 
-            # rect_left is already mono; boost contrast like test
             gray = cv2.equalizeHist(rect_left)
-
             detections = self.apriltag_detector.detect(gray)
 
             if not detections:
                 continue
 
-            det = detections[0]  # Use first detection for now
+            det = detections[0]
             cx, cy = det.center
             x = int(round(cx))
             y = int(round(cy))
@@ -266,18 +213,16 @@ class ParkingVisionNode(Node):
             depth_m = self._get_tag_depth_from_area(depth_frame, det)
             if depth_m is None:
                 self.get_logger().warn(
-                    f"[WARN] No valid depth inside AprilTag area for "
-                    f"sample {i+1}."
+                    f"No valid depth inside AprilTag area for sample {i+1}."
                 )
                 continue
 
             depths.append(depth_m)
             self.get_logger().info(
-                f"[INFO] Sample {i+1}: Tag ID={det.tag_id}, "
+                f"Sample {i+1}: Tag ID={det.tag_id}, "
                 f"center_pixel=({x},{y}), median_depth={depth_m:.3f} m"
             )
 
-        # Always grab a fresh RGB frame for downstream color detection
         frame_bgr = self._get_rgb_frame()
         if frame_bgr is None:
             self.get_logger().error(
@@ -297,11 +242,8 @@ class ParkingVisionNode(Node):
         )
         return frame_bgr, tag_point, median_depth_m
 
-    # -------------------------------------------------------------------------
-    # Color masks (red and blue) – unchanged
-    # -------------------------------------------------------------------------
     def _red_mask(self, frame_bgr: np.ndarray) -> np.ndarray:
-        """Return cleaned-up binary mask of red regions (two HSV lobes)."""
+        """Binary mask of red regions."""
         hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
 
         RED1_LOWER = np.array([0,   70, 50])
@@ -320,10 +262,10 @@ class ParkingVisionNode(Node):
         return red_mask
 
     def _blue_mask(self, frame_bgr: np.ndarray) -> np.ndarray:
-        """Return cleaned-up binary mask of blue tape (still here for logging/debug)."""
+        """Binary mask of blue tape."""
         hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
 
-        BLUE_LOWER = np.array([93, 45,  104], dtype=np.uint8)
+        BLUE_LOWER = np.array([93, 45, 104], dtype=np.uint8)
         BLUE_UPPER = np.array([111, 255, 255], dtype=np.uint8)
 
         mask = cv2.inRange(hsv, BLUE_LOWER, BLUE_UPPER)
@@ -334,16 +276,11 @@ class ParkingVisionNode(Node):
 
         return mask
 
-    # -------------------------------------------------------------------------
-    # Red / "NO PARKING" detection – unchanged
-    # -------------------------------------------------------------------------
     def detect_no_parking_side_by_circle(
         self,
         frame_bgr: np.ndarray
     ) -> Optional[str]:
-        """
-        Detect a red, mostly circular region (approximating a NO PARKING sign).
-        """
+        """Try to find a red, roughly circular sign and return its side."""
         red_mask = self._red_mask(frame_bgr)
         contours, _ = cv2.findContours(
             red_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
@@ -398,20 +335,14 @@ class ParkingVisionNode(Node):
         return sign_side
 
     def error_correction(self, measured_m: float) -> float:
-        """
-        Linear depth calibration:
-
-            corrected = a * measured + b
-        """
+        """Apply linear depth calibration."""
         return measured_m * 0.834028 + 0.0863219
 
     def detect_no_parking_side_by_red_imbalance(
         self,
         frame_bgr: np.ndarray
     ) -> Optional[str]:
-        """
-        Fallback: red pixel imbalance between left and right halves.
-        """
+        """Fallback: compare red pixels in left vs right halves."""
         red_mask = self._red_mask(frame_bgr)
         h, w = red_mask.shape[:2]
         mid_x = w // 2
@@ -432,10 +363,7 @@ class ParkingVisionNode(Node):
         if diff_ratio < 0.2:
             return None
 
-        if red_left > red_right:
-            side = "left"
-        else:
-            side = "right"
+        side = "left" if red_left > red_right else "right"
 
         self.get_logger().info(
             f"Red imbalance detected: left={red_left}, right={red_right}, "
@@ -443,15 +371,12 @@ class ParkingVisionNode(Node):
         )
         return side
 
-    # -------------------------------------------------------------------------
-    # Service handler
-    # -------------------------------------------------------------------------
     def handle_get_parking_spots(self, request, response):
+        """Service callback: choose side and return depth."""
         self.get_logger().info(
             "GetParkingSpots (Trigger) called, sampling AprilTag depth..."
         )
 
-        # Sample stereo / rectified-left for AprilTag distance
         frame_bgr, tag_point, depth_m = self.sample_tag_depth(num_samples=10)
 
         if frame_bgr is None:
@@ -460,15 +385,13 @@ class ParkingVisionNode(Node):
             response.message = "Camera failure: no RGB frame."
             return response
 
-        # --- NO PARKING detection (circle first, then red imbalance) ---
         no_parking_side: Optional[str] = self.detect_no_parking_side_by_circle(frame_bgr)
         if no_parking_side is None:
             no_parking_side = self.detect_no_parking_side_by_red_imbalance(frame_bgr)
 
         if no_parking_side is None:
             self.get_logger().info(
-                "No NO PARKING sign detected (neither circle-like nor red imbalance). "
-                "Defaulting side=right."
+                "No NO PARKING sign detected. Defaulting side=right."
             )
             selected_side = "right"
         else:
@@ -477,17 +400,14 @@ class ParkingVisionNode(Node):
                 f"NO PARKING region on {no_parking_side}; returning opposite side={selected_side}"
             )
 
-        # --- Depth + correction ---
         no_tag = False
-        corrected_depth: float
 
         if depth_m is None:
             no_tag = True
             depth_m = 1000.0
             corrected_depth = depth_m
             self.get_logger().error(
-                "No valid AprilTag depth from any sample; "
-                "sending sentinel depth_m=1000.0 and marking success=False."
+                "No valid AprilTag depth; sending sentinel depth_m=1000.0 and success=False."
             )
         else:
             raw_depth = depth_m

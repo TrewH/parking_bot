@@ -5,7 +5,6 @@ from typing import Any
 
 from pyvesc.VESC import VESC
 
-# If you discover the correct field is "tachometer_abs", change this:
 COUNTER_ATTR = "tachometer_abs"
 
 
@@ -17,7 +16,6 @@ def get_counter(vesc: VESC) -> int:
 
 
 def main() -> None:
-    # 1. Connect to VESC
     vesc = VESC(serial_port="/dev/ttyACM0")
 
     print("=== Ticks per Revolution Measurement ===")
@@ -28,30 +26,28 @@ def main() -> None:
 
     input("When ready, press Enter to start the wheel spinning slowly...")
 
-    # 2. Start slow rotation
-    duty = 0.015  # adjust if needed (smaller if too fast, larger if it doesn't move)
+    # Start slow rotation
+    duty = 0.015
     vesc.set_duty_cycle(duty)
     print(f"Wheel spinning at duty_cycle = {duty}.")
     print("Let it spin for a second to stabilize...\n")
     time.sleep(1.5)
 
-    # 3. First reference pass (start of revolution)
+    # First reference pass
     print("Watch your tape mark on the tire.")
     input("Press Enter when the mark is at your reference point (START)...")
     start = get_counter(vesc)
     print(f"Start {COUNTER_ATTR}: {start}")
 
-    # 4. Second reference pass (end of revolution)
+    # Second reference pass
     print("\nLet the wheel keep spinning.")
     input("Press Enter again when the SAME mark comes back to that same spot (END)...")
     end = get_counter(vesc)
     print(f"End {COUNTER_ATTR}: {end}")
 
-    # 5. Stop the wheel
     vesc.set_duty_cycle(0.0)
     print("Wheel stopped.\n")
 
-    # 6. Compute delta
     delta = end - start
     delta_abs = abs(delta)
 

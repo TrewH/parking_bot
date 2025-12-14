@@ -17,18 +17,11 @@ from adafruit_pca9685 import PCA9685
 from adafruit_motor import servo
 
 
-# -----------------------------
-# I2C + PCA9685 Setup
-# -----------------------------
 i2c = busio.I2C(board.SCL, board.SDA)
-
 pca = PCA9685(i2c)
-pca.frequency = 50   # Standard servo frequency
+pca.frequency = 50
 
 
-# =============================================================================
-# SweeperServo Class
-# =============================================================================
 class SweeperServo:
     def __init__(self, channel=0, min_pulse=500, max_pulse=2500, home_angle=0):
         """
@@ -47,18 +40,13 @@ class SweeperServo:
         print(f"[Servo] Initializing… moving to home angle {home_angle}°")
         self.set_angle(home_angle)
 
-    # ------------------------------------------------------------------
     def set_angle(self, angle):
-        """
-
-        """
         angle = angle
         self.servo.angle = angle
         self.current_angle = angle
         print(f"[Servo] Set angle → {angle}°")
         time.sleep(0.3)
 
-    # ------------------------------------------------------------------
     def full_sweep(self, sweeprange, speed=0.02):
         """
         Sweep from home_angle → (home_angle + sweeprange°) and back,
@@ -78,12 +66,10 @@ class SweeperServo:
             self.servo.angle = a
             time.sleep(speed)
 
-
         # Sweep backward
         print("[Servo] Sweeping Backward")
         for a in range(end, start + 1, 2):
             self.servo.angle = a
-            #print(a) #debugging
             time.sleep(speed)
 
         # Return to home

@@ -7,9 +7,9 @@ import rclpy
 from rclpy.node import Node
 from example_interfaces.srv import Trigger
 
-from .HAL import ParkingHAL  # Your HAL wrapper
+from .HAL import ParkingHALr
 
-PAUSE_BETWEEN_MOVES_S: float = 0.5  # to match your robot_control.py
+PAUSE_BETWEEN_MOVES_S: float = 0.5
 
 
 class Orchestrator(Node):

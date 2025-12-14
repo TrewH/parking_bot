@@ -9,7 +9,7 @@ import depthai as dai
 import numpy as np
 
 
-MAX_VALID_DEPTH_MM = 8000  # treat >= 8 m as "invalid / infinity" for our use-case
+MAX_VALID_DEPTH_MM = 8000
 
 
 def get_depth_at_pixel(
@@ -35,7 +35,7 @@ def get_depth_at_pixel(
             return raw_mm / 1000.0
         return None
 
-    # Try 3×3, then 5×5, ... up to max_radius
+    # Try 3×3, then 5×5, ...
     for radius in range(1, max_radius + 1):
         x0 = max(0, x - radius)
         x1 = min(w, x + radius + 1)
@@ -55,10 +55,6 @@ def get_depth_at_pixel(
 def create_pipeline() -> dai.Pipeline:
     pipeline = dai.Pipeline()
 
-    # ==========================================================
-    # RGB camera (aligned with stereo depth)
-    # Use 640x400 to match mono 400p aspect ratio for alignment.
-    # ==========================================================
     cam_rgb = pipeline.create(dai.node.ColorCamera)
     cam_rgb.setResolution(dai.ColorCameraProperties.SensorResolution.THE_1080_P)
     cam_rgb.setPreviewSize(640, 400)
@@ -67,53 +63,35 @@ def create_pipeline() -> dai.Pipeline:
     cam_rgb.setColorOrder(dai.ColorCameraProperties.ColorOrder.BGR)
     cam_rgb.setFps(15)
 
-    # ==========================================================
-    # Mono cameras
-    # ==========================================================
     mono_left = pipeline.create(dai.node.MonoCamera)
     mono_right = pipeline.create(dai.node.MonoCamera)
 
     mono_left.setBoardSocket(dai.CameraBoardSocket.LEFT)
     mono_right.setBoardSocket(dai.CameraBoardSocket.RIGHT)
 
-    # 400p gives good compromise of precision and speed, and
-    # matches our RGB preview aspect ratio.
     mono_left.setResolution(dai.MonoCameraProperties.SensorResolution.THE_400_P)
     mono_right.setResolution(dai.MonoCameraProperties.SensorResolution.THE_400_P)
     mono_left.setFps(15)
     mono_right.setFps(15)
 
-    # ==========================================================
-    # Stereo depth node tuned for precision (not density/range)
-    # ==========================================================
     stereo = pipeline.create(dai.node.StereoDepth)
     stereo.setDefaultProfilePreset(dai.node.StereoDepth.PresetMode.HIGH_ACCURACY)
 
-    # Enable subpixel for higher depth precision
     stereo.setSubpixel(True)
 
-    # Better accuracy near 1–5 m (we don't need ultra-close or 20 m range)
     stereo.setExtendedDisparity(False)
 
-    # Left-right check helps reject bad matches (improves reliability)
     stereo.setLeftRightCheck(True)
 
-    # Small median filter to clean up noise while preserving edges
     stereo.setMedianFilter(dai.MedianFilter.KERNEL_3x3)
 
-    # Align depth to RGB camera
     stereo.setDepthAlign(dai.CameraBoardSocket.RGB)
 
-    # Optionally tweak confidence; lower threshold -> more points, higher -> fewer but cleaner
     stereo.setConfidenceThreshold(200)
 
-    # Link mono to stereo
     mono_left.out.link(stereo.left)
     mono_right.out.link(stereo.right)
 
-    # ==========================================================
-    # XLink outputs
-    # ==========================================================
     xout_rgb = pipeline.create(dai.node.XLinkOut)
     xout_rgb.setStreamName("rgb")
     cam_rgb.preview.link(xout_rgb.input)
@@ -162,7 +140,6 @@ def main() -> None:
                 detections = detector.detect(gray)
 
                 if detections:
-                    # Use the first detection (you can loop if needed)
                     det = detections[0]
                     x, y = int(det.center[0]), int(det.center[1])
                     print(f"[INFO] Tag {det.tag_id} at pixel ({x}, {y})")
@@ -180,12 +157,10 @@ def main() -> None:
                     else:
                         print("[WARN] No valid depth at tag center (or depth was infinite).\n")
 
-                    # Visualize the tag center on the RGB image
                     cv2.circle(frame_bgr, (x, y), 5, (0, 0, 255), 2)
                 else:
                     print("[INFO] No AprilTag detected.\n")
 
-                # Show RGB window
                 cv2.imshow("RGB", frame_bgr)
                 if cv2.waitKey(1) & 0xFF == ord("q"):
                     break

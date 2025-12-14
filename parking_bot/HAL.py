@@ -9,35 +9,13 @@
 #   - This HAL uses a fixed duty cycle and known tachometer per meter values.
 #   - All higher-level logic should use drive() and set_steering(),
 #     rather than interfacing with the VESC directly.
+#   - We use a fixed duty cycle and specify desired distance in drive() argument.
+#   - Must be configured with tach_calibration for accurate distance travel.
+# Typical use:
+#     hal = ParkingHAL()
+#     hal.drive(1.0)
+#     hal.set_steering(0.5)
 # =============================================================================
-
-
-"""
-Hardware Abstraction Layer (HAL).
-
-
-This module is intended wrap VESC so the rest of the project can make calls based on distance commands
-rather than duty cycles and on-durations.
-
-
-We will use 0.05 duty cycle as the only speed in this project, and measure distance based on tachometry readings
-from the VESC to ensure accurate distance movements.  
-
-
-The rest of the robot's code should treat this HAL as the only interface to the physical car.
-
-
-Typical use:
-    hal = ParkingHAL()
-    hal.drive_forward(1.0)      # ~1 meter
-    hal.drive_backward(0.3)
-    hal.turn(0.5)               # slight right
-
-
-Configuration:
-    Edit HALConfig() to match your car's servo values, duty cycle, and
-    measured straight-line speed.
-"""
 
 
 from __future__ import annotations
@@ -47,29 +25,16 @@ import math
 from pyvesc.VESC import VESC
 
 
-
-
 class ParkingHAL:
-    """
-    Internally we convert distance to time assuming constant speed and
-    apply a fixed duty cycle. This class will produce callable methods we can use
-    after determining what distances and angles we want to drive.
-    """
-
-
     WHEEL_DIAMETER_M: float = 0.101  # 101 mm
     TACH_COUNTS_PER_REV: float = 143.0
     DIST_PER_TACH: float = (
         math.pi * WHEEL_DIAMETER_M / TACH_COUNTS_PER_REV
     )  # ≈ 0.0022189 m/count
 
-
     def __init__(self, serial_port: str = "/dev/ttyACM0") -> None:
         self.vesc = VESC(serial_port=serial_port)
         self.DUTY_CYCLE = 0.03
-
-
-
 
     def _get_tach(self) -> int:
         """
@@ -84,11 +49,9 @@ class ParkingHAL:
     def _set_duty(self, duty: float) -> None:
         self.vesc.set_duty_cycle(duty)
 
-
     def stop(self) -> None:
         """Immediately stop the motor."""
         self._set_duty(0.0)
-
 
     def set_steering(self, angle: float = 0.0) -> None:
         """
@@ -97,11 +60,10 @@ class ParkingHAL:
         self.vesc.set_servo(angle)
         time.sleep(0.25)
 
-
     def drive(self, distance_m: float) -> None:
         """
         Drive forward (distance_m > 0) or backward (distance_m < 0)
-        by a given distance in meters, using tachometer feedback.
+        by a given distance in meters using tachometer feedback.
 
         This is a blocking method.
         """
@@ -117,7 +79,7 @@ class ParkingHAL:
         poll_hz: float = 50.0
         period = 1.0 / poll_hz
 
-        # Direction: +1 for forward, -1 for backward
+        # Direction: +1 for forward -1 for backward
         direction = 1 if distance_m > 0 else -1
 
         # Find target tach counts
@@ -125,7 +87,7 @@ class ParkingHAL:
 
         start_tach = self._get_tach()
 
-        # Safety timeout (seconds)
+        # Safety timeout
         max_time_s = 10.0
         start_time = time.time()
 
@@ -177,7 +139,7 @@ class ParkingHAL:
                 except Exception:
                     pass
 
-        # Finally, close the underlying serial object (name depends on version)
+        # Close the underlying serial object
         for serial_attr in ("serial_port", "ser", "_ser"):
             ser = getattr(self.vesc, serial_attr, None)
             if ser is not None:
