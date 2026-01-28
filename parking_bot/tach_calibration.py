@@ -16,7 +16,6 @@ def get_counter(vesc: VESC) -> int:
 
 
 def main() -> None:
-    # Connect to VESC
     vesc = VESC(serial_port="/dev/ttyACM0")
 
     print("=== Ticks per Revolution Measurement ===")
@@ -28,19 +27,19 @@ def main() -> None:
     input("When ready, press Enter to start the wheel spinning slowly...")
 
     # Start slow rotation
-    duty = 0.015  
+    duty = 0.015
     vesc.set_duty_cycle(duty)
     print(f"Wheel spinning at duty_cycle = {duty}.")
     print("Let it spin for a second to stabilize...\n")
     time.sleep(1.5)
 
-    # First reference pass (start of revolution)
+    # First reference pass
     print("Watch your tape mark on the tire.")
     input("Press Enter when the mark is at your reference point (START)...")
     start = get_counter(vesc)
     print(f"Start {COUNTER_ATTR}: {start}")
 
-    # Second reference pass (end of revolution)
+    # Second reference pass
     print("\nLet the wheel keep spinning.")
     input("Press Enter again when the SAME mark comes back to that same spot (END)...")
     end = get_counter(vesc)

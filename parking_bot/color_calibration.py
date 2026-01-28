@@ -4,7 +4,6 @@ import cv2
 import numpy as np
 import depthai as dai
 
-
 def create_pipeline() -> dai.Pipeline:
     pipeline = dai.Pipeline()
 
@@ -35,11 +34,11 @@ def main() -> None:
         cv2.namedWindow(rgb_win)
         cv2.namedWindow(mask_win)
 
-        cv2.createTrackbar("H_min", mask_win, 0,   179, nothing)
-        cv2.createTrackbar("H_max", mask_win, 179, 179, nothing)
-        cv2.createTrackbar("S_min", mask_win, 0,   255, nothing)
+        cv2.createTrackbar("H_min", mask_win, 93,   179, nothing)
+        cv2.createTrackbar("H_max", mask_win, 111, 179, nothing)
+        cv2.createTrackbar("S_min", mask_win, 45,   255, nothing)
         cv2.createTrackbar("S_max", mask_win, 255, 255, nothing)
-        cv2.createTrackbar("V_min", mask_win, 0,   255, nothing)
+        cv2.createTrackbar("V_min", mask_win, 104,   255, nothing)
         cv2.createTrackbar("V_max", mask_win, 255, 255, nothing)
 
         print("Adjust HSV sliders until only the blue tape is white in the mask.")
